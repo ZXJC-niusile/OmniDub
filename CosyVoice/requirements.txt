@@ -1,0 +1,16 @@
+# CosyVoice runtime dependencies (inference only, training deps removed)
+# torch / torchaudio are installed separately via CUDA-indexed pip in install_all.sh
+# scipy / numpy are provided by the parent project's requirements.txt
+
+tqdm
+hyperpyyaml
+modelscope
+onnxruntime
+openai-whisper
+inflect
+einops
+x-transformers
+omegaconf
+transformers
+tiktoken
+regex

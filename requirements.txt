@@ -1,0 +1,10 @@
+gradio
+loguru
+yt-dlp
+scipy
+librosa
+numpy
+python-dotenv
+openai
+audiostretchy
+Pillow

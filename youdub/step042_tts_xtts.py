@@ -1,0 +1,176 @@
+import os
+import re
+import importlib
+import pickle
+import threading
+from contextlib import contextmanager
+from TTS.api import TTS
+from loguru import logger
+import numpy as np
+import torch
+import time
+from .utils import save_wav, resolve_torch_device
+_models = {}
+_tts_locks = {}
+_models_lock = threading.Lock()
+_cpu_model = None
+_cpu_lock = threading.Lock()
+
+
+@contextmanager
+def _torch_load_weights_compat():
+    """
+    Some TTS/XTTS checkpoints fail on torch>=2.6 default weights_only=True.
+    Temporarily force weights_only=False during model loading.
+    """
+    original_torch_load = torch.load
+
+    def _patched_torch_load(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return original_torch_load(*args, **kwargs)
+
+    torch.load = _patched_torch_load
+    try:
+        yield
+    finally:
+        torch.load = original_torch_load
+
+
+def _allowlist_unsupported_global_from_error(error_message: str) -> bool:
+    """
+    PyTorch 2.6+ uses weights_only=True by default in torch.load.
+    Old XTTS checkpoints may reference config classes that need allowlisting.
+    """
+    pattern = r"Unsupported global: GLOBAL ([A-Za-z0-9_\.]+)"
+    match = re.search(pattern, error_message or "")
+    if not match:
+        return False
+    full_name = match.group(1)
+    if "." not in full_name:
+        return False
+    module_name, attr_name = full_name.rsplit(".", 1)
+    try:
+        module = importlib.import_module(module_name)
+        attr = getattr(module, attr_name)
+        torch.serialization.add_safe_globals([attr])
+        logger.warning(f"Allowlisted torch global for XTTS checkpoint: {full_name}")
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to allowlist torch global: {full_name}, err={e}")
+        return False
+
+def init_TTS():
+    load_model()
+    
+def load_model(model_path="tts_models/multilingual/multi-dataset/xtts_v2", device='auto'):
+    device = str(resolve_torch_device(device))
+    with _models_lock:
+        existing = _models.get(device)
+        if existing is not None:
+            return existing
+        _tts_locks.setdefault(device, threading.Lock())
+
+    logger.info(f'Loading TTS model from {model_path} on {device}')
+    t_start = time.time()
+    last_error = None
+    allowlisted = []
+    max_attempts = 12
+    loaded = None
+    with _torch_load_weights_compat():
+        for _ in range(max_attempts):
+            try:
+                loaded = TTS(model_path).to(device)
+                break
+            except pickle.UnpicklingError as e:
+                last_error = e
+                # Auto-fix the common torch>=2.6 checkpoint allowlist issue.
+                if not _allowlist_unsupported_global_from_error(str(e)):
+                    raise
+                match = re.search(r"Unsupported global: GLOBAL ([A-Za-z0-9_\.]+)", str(e) or "")
+                if match:
+                    allowlisted.append(match.group(1))
+            except Exception as e:
+                last_error = e
+                raise
+    if loaded is None and last_error is not None:
+        raise RuntimeError(
+            f'Failed to load XTTS after {max_attempts} attempts. '
+            f'allowlisted={allowlisted}. last_error={last_error}'
+        )
+    with _models_lock:
+        _models[device] = loaded
+    t_end = time.time()
+    logger.info(f'TTS model loaded on {device} in {t_end - t_start:.2f}s')
+    return loaded
+    
+
+def _is_cuda_runtime_error(error: Exception) -> bool:
+    msg = str(error).lower()
+    cuda_markers = [
+        'device-side assert triggered',
+        'indexselectsmallindex',
+        'cuda error',
+        'cublas',
+        'cudnn',
+    ]
+    return any(marker in msg for marker in cuda_markers)
+
+
+def _get_cpu_model(model_name: str):
+    global _cpu_model
+    if _cpu_model is None:
+        logger.warning('Initializing XTTS CPU fallback model...')
+        with _torch_load_weights_compat():
+            _cpu_model = TTS(model_name).to('cpu')
+    return _cpu_model
+
+
+def tts(text, output_path, speaker_wav, model_name="tts_models/multilingual/multi-dataset/xtts_v2", device='auto', language='zh-cn'):
+    if os.path.exists(output_path):
+        logger.info(f'TTS output already exists: {text}')
+        return
+    device = str(resolve_torch_device(device))
+    model = load_model(model_name, device)
+    tts_lock = _tts_locks.setdefault(device, threading.Lock())
+
+    last_error = None
+    for retry in range(3):
+        try:
+            # XTTS model is shared across pipeline workers; inference must be serialized.
+            with tts_lock:
+                wav = model.tts(text, speaker_wav=speaker_wav, language=language)
+            wav = np.array(wav)
+            save_wav(wav, output_path)
+            logger.info(f'TTS {text}')
+            return
+        except Exception as e:
+            last_error = e
+            logger.warning(f'TTS failed: {text}')
+            logger.warning(e)
+            if _is_cuda_runtime_error(e):
+                logger.warning('XTTS CUDA runtime error detected, retrying on CPU fallback...')
+                try:
+                    cpu_model = _get_cpu_model(model_name)
+                    with _cpu_lock:
+                        wav = cpu_model.tts(text, speaker_wav=speaker_wav, language=language)
+                    wav = np.array(wav)
+                    save_wav(wav, output_path)
+                    logger.warning(f'TTS CPU fallback succeeded: {text}')
+                    return
+                except Exception as cpu_e:
+                    last_error = cpu_e
+                    logger.warning(f'TTS CPU fallback failed: {cpu_e}')
+
+    raise RuntimeError(f'XTTS failed after retries, text={text}, err={last_error}')
+
+
+if __name__ == '__main__':
+    import sys
+    if len(sys.argv) < 2:
+        print(f"Usage: python {sys.argv[0]} <speaker_wav_path>")
+        sys.exit(1)
+    speaker_wav = sys.argv[1]
+    while True:
+        text = input('Enter text: ')
+        tts(text, f'playground/{text}.wav', speaker_wav)
+        
