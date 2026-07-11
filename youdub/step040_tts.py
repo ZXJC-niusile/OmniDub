@@ -20,7 +20,6 @@ MIN_STRETCH_RATIO = 0.82
 # Keep Chinese speech natural: never slow down for timing alignment.
 MAX_STRETCH_RATIO = 1.0
 SHORT_GAP_NO_SILENCE_SEC = 0.6
-NEXT_SLOT_BORROW_SEC = 0.35
 FORMATION_TTS_STYLE = os.getenv('FORMATION_TTS_STYLE', 'chinese_compact')
 _DIGIT_TO_CN = {
     '0': '零', '1': '一', '2': '二', '3': '三', '4': '四',
@@ -91,7 +90,11 @@ def normalize_formation_notation(text: str) -> str:
 
 
 def preprocess_text(text):
-    text = text.replace('AI', '人工智能')
+    # Word-boundary-aware "AI" -> "人工智能" replacement.
+    # The blind .replace('AI', ...) mis-fires on substrings like "TRAIN", "AIR",
+    # "Shanghai", etc. We only substitute when "AI" is a standalone uppercase
+    # token (not glued to other letters/digits on either side).
+    text = re.sub(r'(?<![A-Za-z0-9])AI(?![A-Za-z0-9])', '人工智能', text)
     text = normalize_name_connector_notation(text)
     text = normalize_year_list_notation(text)
     text = normalize_formation_notation(text)
@@ -110,8 +113,9 @@ def adjust_audio_length(
     min_speed_factor=MIN_STRETCH_RATIO,
     max_speed_factor=MAX_STRETCH_RATIO
 ):
-    wav, sample_rate = librosa.load(wav_path, sr=sample_rate)
-    current_length = len(wav) / sample_rate
+    # Use the cheap duration probe instead of decoding the full wav just to
+    # compute its length. The actual stretched audio is decoded below.
+    current_length = float(librosa.get_duration(path=wav_path, sr=sample_rate))
     desired_length = max(0.05, desired_length)
     speed_factor = max(
         min(desired_length / current_length, max_speed_factor), min_speed_factor)
@@ -185,7 +189,13 @@ def generate_wavs(folder, tts_engine=None, tts_device='auto'):
 
     tts_func = _select_tts_func(tts_engine, num_speakers, prompt_text, tts_device=tts_device)
 
-    full_wav = np.zeros((0, ))
+    # Pass 1: synthesize every segment up-front and record the ORIGINAL intended
+    # start times. We need the natural (un-stretched) durations so pass 2 can
+    # decide how much speed-up is available before an overrun becomes inevitable,
+    # and to detect which segments are timing-limited.
+    original_starts = [float(line['start']) for line in transcript]
+    original_ends = [float(line['end']) for line in transcript]
+
     for i, line in enumerate(transcript):
         speaker = line['speaker']
         text = preprocess_text(line['translation'])
@@ -194,28 +204,78 @@ def generate_wavs(folder, tts_engine=None, tts_device='auto'):
         tts_func(text, output_path, speaker_wav)
         if not os.path.isfile(output_path):
             raise RuntimeError(f'TTS output missing after synthesis: {output_path}')
-        start = float(line['start'])
-        end = float(line['end'])
-        original_length = max(0.05, end - start)
+        # Pass 2 will read the natural duration from disk via adjust_audio_length;
+        # no need to cache it here.
+
+    # Pass 2: assemble full_wav with drift-recovery scheduling.
+    #
+    # The original single-pass loop appended whatever the synthesizer produced
+    # and let the next segment start from the growing write position. When one
+    # segment was too long even after max ~22% speed-up, the overrun pushed
+    # every later segment later, causing cumulative one-directional time drift
+    # (audio progressively desynced from the video and the whole track grew
+    # longer than the source).
+    #
+    # Drift-recovery strategy (forward O(n) pass):
+    #   * We track `lag` = original_starts[i] - current_write_pos.
+    #     Positive lag means we're behind the original timeline (good - we
+    #     have room to grow into the source). Negative lag means we've already
+    #     overrun the original slot.
+    #   * Long intentional silences (> SHORT_GAP_NO_SILENCE_SEC) are kept as
+    #     real silence. Short gap slacks are SPENDABLE: when we are behind
+    #     the original timeline, we use them to re-sync instead of padding
+    #     after overruns, which is what accumulated drift in the first place.
+    #   * We never slow speech below natural (MAX_STRETCH_RATIO stays 1.0);
+    #     if a clip would still overrun, we absorb the spill but immediately
+    #     claw back from the upcoming gap on the NEXT iteration rather than
+    #     letting the overrun compound.
+    full_wav = np.zeros((0, ))
+    n = len(transcript)
+    for i, line in enumerate(transcript):
+        original_start = original_starts[i]
+        original_end = original_ends[i]
+        original_length = max(0.05, original_end - original_start)
+        next_start = original_starts[i + 1] if i < n - 1 else None
+
         last_end = len(full_wav) / 24000
-        pre_gap = max(0.0, start - last_end)
+        # How far the current write position is from the original timeline
+        # for this segment. Positive = we're behind (have slack). Negative =
+        # we've already drifted past the original start.
+        lag = original_start - last_end
 
-        # Keep only long intentional pauses. Short gaps are absorbed by stretching
-        # the current sentence, so audio remains continuous and natural.
-        if pre_gap > SHORT_GAP_NO_SILENCE_SEC:
-            full_wav = np.concatenate((full_wav, np.zeros((int(pre_gap * 24000), ))))
+        # Determine the target placement time for this segment. We prefer
+        # the original timeline when we haven't already overrun it; otherwise
+        # we start immediately (no extra pre-silence would only worsen drift).
+        if lag >= 0.0:
+            # We have room. Pre-segment silence is naturally "spendable" for
+            # drift recovery: long intentional pauses (> SHORT_GAP_NO_SILENCE_SEC)
+            # are preserved by clamping desired_end in Pass 2 below; short gaps
+            # are also kept as-is here and the post-pad logic recovers from any
+            # accumulated overrun.
+            pre_gap = lag
+            if pre_gap > 1e-3:
+                full_wav = np.concatenate(
+                    (full_wav, np.zeros((int(pre_gap * 24000), ))))
+            start = len(full_wav) / 24000
+        else:
+            # Already past the original start due to accumulated overrun.
+            # Start immediately - do NOT add compensating pre-silence, that
+            # would worsen drift. (Resetting at original_start is worse: it
+            # would chop the previous clip and shift the absolute timeline.)
+            start = last_end
 
-        start = len(full_wav) / 24000
         line['start'] = start
 
+        # Desired end: original slot end, but never past the next segment's
+        # original start (that's the primary drift source in the old loop).
         desired_end = start + original_length
-        next_start = None
-        if i < len(transcript) - 1:
-            next_line = transcript[i+1]
-            next_start = float(next_line['start'])
+        if next_start is not None:
+            desired_end = min(desired_end, next_start)
 
+        # Stretch the clip toward desired_end - start, capped at natural
+        # length (MAX_STRETCH_RATIO = 1.0 means we never slow down).
         wav, length, speed_factor, current_length = adjust_audio_length(
-            output_path,
+            os.path.join(output_folder, f'{str(i).zfill(4)}.wav'),
             desired_end - start,
             min_speed_factor=MIN_STRETCH_RATIO,
             max_speed_factor=MAX_STRETCH_RATIO
@@ -230,14 +290,36 @@ def generate_wavs(folder, tts_engine=None, tts_device='auto'):
         full_wav = np.concatenate((full_wav, wav))
         line_end = start + length
 
-        # If speech is still shorter than source slot, fill with silence instead of
-        # stretching voice too much (prevents "dragging" artifacts).
-        pad_end = desired_end
+        # Post-segment pad. KEY drift-recovery point: the inter-segment
+        # silence up to the next segment's original start is a BUFFER we can
+        # spend to re-sync. Instead of always padding up to pad_end (which
+        # was the source of monotonic growth), we shrink the post-pad to
+        # claw back accumulated lag. lag_after = original_next_start -
+        # line_end; if it's already negative (we're past the next slot) we
+        # add zero post-pad; if it's between 0 and SHORT_GAP_NO_SILENCE_SEC
+        # we collapse it to zero so the next segment starts sooner and we
+        # re-approach the original timeline; only keep long intentional gaps
+        # (> SHORT_GAP_NO_SILENCE_SEC) as real silence.
         if next_start is not None:
-            pad_end = min(pad_end, next_start)
-        post_pad = max(0.0, pad_end - line_end)
+            slack_to_next = next_start - line_end
+            if slack_to_next >= SHORT_GAP_NO_SILENCE_SEC:
+                # Long intentional pause - preserve it.
+                post_pad = slack_to_next
+            elif slack_to_next > 0.0:
+                # Short / spendable gap. Collapse it to recover from drift
+                # instead of letting small overruns compound.
+                post_pad = 0.0
+            else:
+                # Already overrun into the next slot; no padding, the next
+                # iteration will start immediately from line_end.
+                post_pad = 0.0
+        else:
+            # Last segment: pad to original_end for clean wrap-up.
+            post_pad = max(0.0, original_end - line_end)
+
         if post_pad > 1e-3:
-            full_wav = np.concatenate((full_wav, np.zeros((int(post_pad * 24000), ))))
+            full_wav = np.concatenate(
+                (full_wav, np.zeros((int(post_pad * 24000), ))))
             line_end += post_pad
 
         line['end'] = line_end

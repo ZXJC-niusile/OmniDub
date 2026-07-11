@@ -14,6 +14,14 @@ logger.info(f'using model {model_name}')
 extra_body = {
     'repetition_penalty': 1.1,
 }
+# Lines translated per API call. Batching cuts request count ~10x vs the old
+# one-call-per-line loop while preserving order via index tags. Env-overridable.
+try:
+    TRANSLATION_BATCH_SIZE = max(1, int(os.getenv('TRANSLATION_BATCH_SIZE', '10')))
+except ValueError:
+    TRANSLATION_BATCH_SIZE = 10
+
+
 def get_necessary_info(info: dict):
     return {
         'title': info.get('title', 'Local Video'),
@@ -127,101 +135,124 @@ def _get_response_text(response):
 
 
 def summarize(info, transcript, target_language='简体中文'):
-    client = OpenAI(
-    # This is the default and can be omitted
-    base_url=os.getenv('OPENAI_API_BASE', 'https://api.openai.com/v1'),
-    api_key=os.getenv('OPENAI_API_KEY')
-)
-    transcript = ' '.join(line['text'] for line in transcript)
-    transcript = ensure_transcript_length(transcript, max_length=2000)
+    client = _make_client()
+    transcript_text = ensure_transcript_length(
+        ' '.join(line['text'] for line in transcript),
+        max_length=2000,
+    )
     info_message = f'Title: "{info["title"]}" Author: "{info["uploader"]}". '
-    
-    full_description = f'The following is the full content of the video:\n{info_message}\n{transcript}\n{info_message}\nAccording to the above content, detailedly Summarize the video in JSON format:\n```json\n{{"title": "", "summary": ""}}\n```'
-    
-    messages = [
-        {'role': 'system',
-            'content': f'You are a expert in the field of this video. Please detailedly summarize the video in JSON format.\n```json\n{{"title": "the title of the video", "summary": "the summary of the video"}}\n```'},
-        {'role': 'user', 'content': full_description},
-    ]
-    retry_message=''
-    success = False
+
+    full_description = (
+        f'The following is the full content of the video:\n{info_message}\n'
+        f'{transcript_text}\n{info_message}\n'
+        f'According to the above content, detailedly Summarize the video in JSON format:\n'
+        f'```json\n{{"title": "", "summary": ""}}\n```'
+    )
+
+    summary_system = (
+        'You are a expert in the field of this video. Please summarize the video '
+        'in JSON format.\n```json\n{"title": "the title of the video", '
+        '"summary": "the summary of the video"}\n```'
+    )
+    # Constant format reminder reused on every retry. The old code appended the
+    # same template to `retry_message` on each failure, which grew the prompt
+    # unboundedly without adding any new information to the model.
+    format_hint = '\nSummarize the video in JSON format:\n```json\n{"title": "", "summary": ""}\n```'
+
+    # Phase 1: produce source-language summary as a JSON object with stable keys.
+    summary_obj = None
     for retry in range(5):
         try:
-            messages = [
-                {'role': 'system', 'content': f'You are a expert in the field of this video. Please summarize the video in JSON format.\n```json\n{{"title": "the title of the video", "summary": "the summary of the video"}}\n```'},
-                {'role': 'user', 'content': full_description+retry_message},
-            ]
             try:
                 response = client.chat.completions.create(
                     model=model_name,
-                    messages=messages,
+                    messages=[
+                        {'role': 'system', 'content': summary_system},
+                        {'role': 'user', 'content': full_description + format_hint},
+                    ],
                     timeout=240,
-                    extra_body=extra_body
+                    extra_body=extra_body,
                 )
             except Exception as api_e:
                 raise RuntimeError(f'chat.completions.create failed: {_format_api_exception(api_e)}')
-            summary = _get_response_text(response)
-            if '视频标题' in summary:
-                raise Exception("Response contains meta-word '视频标题'")
-            logger.info(summary)
-            summary = _extract_json_object(summary)
-            if 'title' not in summary or 'summary' not in summary:
-                raise ValueError(f'Invalid summary json keys: {list(summary.keys())}')
-            summary = {
-                'title': str(summary['title']).replace('title:', '').strip(),
-                'summary': str(summary['summary']).replace('summary:', '').strip()
-            }
-            if 'title' in summary['title']:
+            raw = _get_response_text(response)
+            logger.info(raw)
+            parsed = _extract_json_object(raw)
+            if 'title' not in parsed or 'summary' not in parsed:
+                raise ValueError(f'Invalid summary json keys: {list(parsed.keys())}')
+            cleaned_title = str(parsed['title']).replace('title:', '').strip()
+            cleaned_summary = str(parsed['summary']).replace('summary:', '').strip()
+            if 'title' in cleaned_title:
                 raise Exception('Invalid summary')
-            success = True
+            summary_obj = {'title': cleaned_title, 'summary': cleaned_summary}
             break
         except Exception as e:
-            retry_message += '\nSummarize the video in JSON format:\n```json\n{"title": "", "summary": ""}\n```'
-            logger.warning(f'Summary generation failed\n{e}')
+            logger.warning(f'Summary generation failed (attempt {retry + 1}/5): {e}')
             time.sleep(1)
-    if not success:
-        raise Exception('Summary generation failed')
-        
-    title = summary['title']
-    summary = summary['summary']
+
+    if summary_obj is None:
+        raise Exception('Summary generation failed: max retries exceeded')
+
+    # Phase 2: translate the (title, summary, tags) tuple into target_language.
+    title_en = summary_obj['title']
+    summary_en = summary_obj['summary']
     tags = info['tags']
-    messages = [
-        {'role': 'system',
-            'content': f'You are a native speaker of {target_language}. Please translate the title and summary into {target_language} in JSON format. ```json\n{{"title": "the {target_language} title of the video", "summary": "the {target_language} summary of the video", "tags": [list of tags in {target_language}]}}\n```.'},
-        {'role': 'user',
-            'content': f'The title of the video is "{title}". The summary of the video is "{summary}". Tags: {tags}.\nPlease translate the above title and summary and tags into {target_language} in JSON format. ```json\n{{"title": "", "summary": "", "tags": []}}\n```. Remember to translate the title and the summary and tags into {target_language} in JSON.'},
-    ]
+
+    translate_system = (
+        f'You are a native speaker of {target_language}. Please translate the title '
+        f'and summary into {target_language} in JSON format. '
+        f'```json\n{{"title": "the {target_language} title of the video", '
+        f'"summary": "the {target_language} summary of the video", '
+        f'"tags": [list of tags in {target_language}]}}\n```.'
+    )
+    translate_user = (
+        f'The title of the video is "{title_en}". The summary of the video is '
+        f'"{summary_en}". Tags: {tags}.\nPlease translate the above title and '
+        f'summary and tags into {target_language} in JSON format. '
+        f'```json\n{{"title": "", "summary": "", "tags": []}}\n```. '
+        f'Remember to translate the title and the summary and tags into '
+        f'{target_language} in JSON.'
+    )
+
     for retry in range(10):
         try:
             try:
                 response = client.chat.completions.create(
                     model=model_name,
-                    messages=messages,
+                    messages=[
+                        {'role': 'system', 'content': translate_system},
+                        {'role': 'user', 'content': translate_user},
+                    ],
                     timeout=240,
-                    extra_body=extra_body
+                    extra_body=extra_body,
                 )
             except Exception as api_e:
                 raise RuntimeError(f'chat.completions.create failed: {_format_api_exception(api_e)}')
-            summary = _get_response_text(response)
-            logger.info(summary)
-            summary = _extract_json_object(summary)
-            if 'title' not in summary or 'summary' not in summary or 'tags' not in summary:
-                raise ValueError(f'Invalid translation json keys: {list(summary.keys())}')
-            if target_language in summary['title'] or target_language in summary['summary']:
+            raw = _get_response_text(response)
+            logger.info(raw)
+            translation = _extract_json_object(raw)
+            if 'title' not in translation or 'summary' not in translation or 'tags' not in translation:
+                raise ValueError(f'Invalid translation json keys: {list(translation.keys())}')
+            if target_language in translation['title'] or target_language in translation['summary']:
                 raise Exception('Invalid translation')
-            title = str(summary['title']).strip()
-            if (title.startswith('"') and title.endswith('"')) or (title.startswith('“') and title.endswith('”')) or (title.startswith('‘') and title.endswith('’')) or (title.startswith("'") and title.endswith("'")) or (title.startswith('《') and title.endswith('》')):
-                title = title[1:-1]
-            result = {
-                'title': title,
+            translated_title = str(translation['title']).strip()
+            if (
+                (translated_title.startswith('"') and translated_title.endswith('"'))
+                or (translated_title.startswith('“') and translated_title.endswith('”'))
+                or (translated_title.startswith('‘') and translated_title.endswith('’'))
+                or (translated_title.startswith("'") and translated_title.endswith("'"))
+                or (translated_title.startswith('《') and translated_title.endswith('》'))
+            ):
+                translated_title = translated_title[1:-1]
+            return {
+                'title': translated_title,
                 'author': info['uploader'],
-                'summary': str(summary['summary']),
-                'tags': summary['tags'] if isinstance(summary['tags'], list) else [str(summary['tags'])],
-                'language': target_language
+                'summary': str(translation['summary']),
+                'tags': translation['tags'] if isinstance(translation['tags'], list) else [str(translation['tags'])],
+                'language': target_language,
             }
-            return result
         except Exception as e:
-            logger.warning(f'Translation summary failed\n{e}')
+            logger.warning(f'Translation summary failed (attempt {retry + 1}/10): {e}')
             time.sleep(1)
     raise Exception('Translation summary failed: max retries exceeded')
 
@@ -232,8 +263,12 @@ def translation_postprocess(result):
     result = re.sub(r'(?<=\d),(?=\d)', '', result)
     result = result.replace('²', '的平方').replace(
         '————', '：').replace('——', '：').replace('°', '度')
-    result = result.replace("AI", '人工智能')
-    result = result.replace('变压器', "Transformer")
+    # Word-boundary-aware "AI" -> 人工智能: the old blind replace corrupted any
+    # surviving English token containing "AI" (TRAIN/AIR/product names).
+    result = re.sub(r'(?<![A-Za-z0-9])AI(?![A-Za-z0-9])', '人工智能', result)
+    # NOTE: removed the blind '变压器'->'Transformer' swap — it corrupted genuine
+    # mentions of electrical transformers. ML-term fidelity is now steered by the
+    # translation prompt glossary instead of post-hoc string surgery.
     return result
 
 def valid_translation(text, translation):
@@ -292,7 +327,6 @@ def split_sentences(translation):
         sentences = split_text_into_sentences(translation_text)
         duration_per_char = (item['end'] - item['start']
                              ) / len(translation_text)
-        sentence_start = 0
         for sentence in sentences:
             sentence_end = start + duration_per_char * len(sentence)
 
@@ -305,75 +339,217 @@ def split_sentences(translation):
                 "translation": sentence
             })
 
-            # Update the start for the next sentence
+            # Advance start for the next sentence in this item
             start = sentence_end
-            sentence_start += len(sentence)
     return output_data
     
-def _translate(summary, transcript, target_language='简体中文'):
-    client = OpenAI(
-        # This is the default and can be omitted
+def _make_client():
+    return OpenAI(
         base_url=os.getenv('OPENAI_API_BASE', 'https://api.openai.com/v1'),
-        api_key=os.getenv('OPENAI_API_KEY')
+        api_key=os.getenv('OPENAI_API_KEY'),
     )
-    info = f'This is a video called "{summary["title"]}". {summary["summary"]}.'
-    full_translation = []
-    fixed_message = [
-        {'role': 'system', 'content': f'You are a expert in the field of this video.\n{info}\nTranslate the sentence into {target_language}.下面我让你来充当翻译家，你的目标是把任何语言翻译成中文，请翻译时不要带翻译腔，而是要翻译得自然、流畅和地道，使用优美和高雅的表达方式。请将人工智能的“agent”翻译为“智能体”，强化学习中是`Q-Learning`而不是`Queue Learning`。数学公式写成plain text，不要使用latex。确保翻译正确和简洁。注意信达雅。'},
+
+
+def _translation_system_content(info, target_language):
+    # Shared guidance for batch / single-line / rescue paths. The glossary keeps
+    # ML terms intact (e.g. "Transformer" must NOT become the electrical "变压器"),
+    # replacing the old blind post-hoc string swaps.
+    return (
+        f'You are a expert in the field of this video.\n{info}\n'
+        f'Translate into {target_language}. 请充当翻译家，把内容翻译得自然、流畅、地道，'
+        f'不要翻译腔，使用优美高雅的表达。术语要求：人工智能中的"agent"译为"智能体"；'
+        f'强化学习中是`Q-Learning`而非`Queue Learning`；深度学习语境下的"Transformer"是'
+        f'模型架构名，保持英文"Transformer"，不要译成"变压器"；专有名词、产品名、代码标识符'
+        f'保持原文。数学公式写成 plain text，不要用 latex。确保准确、简洁，注意信达雅。'
+    )
+
+
+def _get_response_text_multiline(response):
+    """Like _get_response_text but preserves newlines (needed to parse the
+    numbered batch format, which _get_response_text would flatten)."""
+    if response is None:
+        raise ValueError('Model response is None (API returned nothing).')
+    choices = getattr(response, 'choices', None)
+    if not choices or not isinstance(choices, list) or len(choices) == 0:
+        raise ValueError(f'Model response has no choices. snapshot={_response_snapshot(response)}')
+    message = getattr(choices[0], 'message', None)
+    if message is None:
+        raise ValueError(f'Model response first choice has no message. snapshot={_response_snapshot(response)}')
+    content = getattr(message, 'content', None)
+    if content is None:
+        raise ValueError(f'Model response content is empty. snapshot={_response_snapshot(response)}')
+    return str(content)
+
+
+_BATCH_LINE_RE = re.compile(r'^\s*[\[\(]?(\d+)[\]\)]?\s*[\.、:：\)）]\s*(.*\S)\s*$')
+
+
+def _parse_numbered_batch(reply, expected):
+    """Parse a numbered reply into a list of length ``expected``; each slot is
+    the translation for that 1-based index or ``None`` if missing/unparseable.
+    Tolerant of extra prose lines and of quote wrapping."""
+    parsed = {}
+    for raw in reply.splitlines():
+        m = _BATCH_LINE_RE.match(raw)
+        if not m:
+            continue
+        i = int(m.group(1))
+        if 1 <= i <= expected and i not in parsed:
+            val = m.group(2).strip()
+            for lq, rq in (('“', '”'), ('"', '"'), ('‘', '’'), ("'", "'")):
+                if len(val) >= 2 and val.startswith(lq) and val.endswith(rq):
+                    val = val[1:-1].strip()
+                    break
+            if val:
+                parsed[i] = translation_postprocess(val)
+    return [parsed.get(i + 1) for i in range(expected)]
+
+
+def _translate_batch(client, system_content, context_pairs, batch_texts, target_language, max_retries=3):
+    """Translate a batch of lines in ONE call. Returns a list aligned to
+    ``batch_texts`` with ``None`` for any line not confidently obtained. Retries
+    the whole batch up to ``max_retries`` times, merging partial results.
+    On retries 2+ the user prompt adds a format emphasis to break out of the
+    case where the model locked onto a malformed output pattern."""
+    n = len(batch_texts)
+    merged = [None] * n
+
+    context_block = ''
+    if context_pairs:
+        refs = '\n'.join(f'- {s[:40]} => {d[:40]}' for s, d in context_pairs[-5:])
+        context_block = f'已翻译片段（仅供术语一致性参考，不要重复输出）：\n{refs}\n\n'
+
+    numbered = '\n'.join(f'{i + 1}. {t}' for i, t in enumerate(batch_texts))
+    base_user_content = (
+        f'{context_block}把下面 {n} 行分别翻译成{target_language}，保持行的顺序与数量。'
+        f'只输出 {n} 行，每行格式为 `序号. 译文`，不要合并或拆分行，不要额外解释。\n\n{numbered}'
+    )
+    format_emphasis = (
+        '\n注意：严格按 `数字 + 半角点 + 空格 + 译文` 一行一条输出，不要使用项目符号、'
+        '不要加粗、不要写说明文字、不要代码块包裹。'
+    )
+
+    for attempt in range(max_retries):
+        # Vary the prompt on retries: identical prompts keep producing identical
+        # failures, so add format reinforcement starting from the 2nd try.
+        user_content = base_user_content if attempt == 0 else base_user_content + format_emphasis
+        messages = [
+            {'role': 'system', 'content': system_content},
+            {'role': 'user', 'content': user_content},
+        ]
+        try:
+            try:
+                response = client.chat.completions.create(
+                    model=model_name, messages=messages, timeout=240, extra_body=extra_body
+                )
+            except Exception as api_e:
+                raise RuntimeError(f'chat.completions.create failed: {_format_api_exception(api_e)}')
+            got = _parse_numbered_batch(_get_response_text_multiline(response), n)
+            for j in range(n):
+                if merged[j] is None and got[j]:
+                    merged[j] = got[j]
+            if all(v is not None for v in merged):
+                break
+        except Exception as e:
+            logger.error(f'batch translate failed (attempt {attempt + 1}/{max_retries}): {e}')
+            time.sleep(1)
+    return merged
+
+
+def _translate_single(client, system_content, context_pairs, text, target_language, max_retries=10):
+    """Per-line translation with strict validation. Returns str or None."""
+    history = []
+    for s, d in context_pairs[-10:]:
+        history.append({'role': 'user', 'content': f'Translate:"{s}"'})
+        history.append({'role': 'assistant', 'content': f'翻译：“{d}”'})
+    few_shot = [
         {'role': 'user', 'content': '使用地道的中文Translate:"Knowledge is power."'},
         {'role': 'assistant', 'content': '翻译：“知识就是力量。”'},
-        {'role': 'user', 'content': '使用地道的中文Translate:"To be or not to be, that is the question."'},
-        {'role': 'assistant', 'content': '翻译：“生存还是毁灭，这是一个值得考虑的问题。”'},]
-    
-    history = []
-    for line in transcript:
-        text = line['text']
-
-        retry_message = 'Only translate the quoted sentence and give me the final translation.'
-        translation = None  # will be set on success or left as None
-        for retry in range(30):
-            messages = fixed_message + \
-                history[-30:] + [{'role': 'user',
-                                  'content': f'使用地道的中文Translate:"{text}"'}]
-
+    ]
+    for _ in range(max_retries):
+        messages = [{'role': 'system', 'content': system_content}] + few_shot + history + [
+            {'role': 'user', 'content': f'使用地道的中文Translate:"{text}"'}
+        ]
+        try:
             try:
-                try:
-                    response = client.chat.completions.create(
-                        model=model_name,
-                        messages=messages,
-                        timeout=240,
-                        extra_body=extra_body
-                    )
-                except Exception as api_e:
-                    raise RuntimeError(f'chat.completions.create failed: {_format_api_exception(api_e)}')
-                translation = _get_response_text(response)
-                logger.info(f'原文：{text}')
-                logger.info(f'译文：{translation}')
-                success, translation = valid_translation(text, translation)
-                if not success:
-                    retry_message += translation
-                    raise Exception('Invalid translation')
+                response = client.chat.completions.create(
+                    model=model_name, messages=messages, timeout=240, extra_body=extra_body
+                )
+            except Exception as api_e:
+                raise RuntimeError(f'chat.completions.create failed: {_format_api_exception(api_e)}')
+            ok, translation = valid_translation(text, _get_response_text(response))
+            if ok:
+                return translation
+        except Exception as e:
+            logger.error(e)
+            time.sleep(1)
+    return None
+
+
+def _rescue_translate(client, text, target_language):
+    """Last-ditch minimal-prompt translation (no history) so an exhausted line
+    is rescued into the target language instead of leaking the source text.
+    Returns str or None."""
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {'role': 'user',
+                 'content': f'Translate the following into {target_language}. '
+                            f'Output only the translation, nothing else:\n"{text}"'}
+            ],
+            timeout=240,
+            extra_body=extra_body,
+        )
+        out = _get_response_text(response).strip()
+        for lq, rq in (('“', '”'), ('"', '"')):
+            if len(out) >= 2 and out.startswith(lq) and out.endswith(rq):
+                out = out[1:-1].strip()
                 break
-            except Exception as e:
-                logger.error(e)
-                if str(e) == 'Internal Server Error':
-                    client = OpenAI(
-                        base_url=os.getenv(
-                            'OPENAI_API_BASE', 'https://api.openai.com/v1'),
-                        api_key=os.getenv('OPENAI_API_KEY')
-                    )
-                time.sleep(1)
+        return translation_postprocess(out) if out else None
+    except Exception as e:
+        logger.error(f'rescue translate failed: {e}')
+        return None
 
-        # Safety net: if all 30 retries exhausted without a valid translation,
-        # fall back to the original text so the pipeline never crashes.
-        if translation is None:
-            logger.warning(f'Translation exhausted retries for: {text[:60]}... — using original text.')
-            translation = text
 
-        full_translation.append(translation)
-        history.append({'role': 'user', 'content': f'Translate:"{text}"'})
-        history.append({'role': 'assistant', 'content': f'翻译：“{translation}”'})
-        time.sleep(0.1)
+def _translate(summary, transcript, target_language='简体中文'):
+    client = _make_client()
+    info = f'This is a video called "{summary["title"]}". {summary["summary"]}.'
+    system_content = _translation_system_content(info, target_language)
+    n = len(transcript)
+    texts = [line['text'] for line in transcript]
+    full_translation = [None] * n  # index-aligned; guarantees order + length
+
+    # Rolling (src, dst) context so terminology stays consistent across batches.
+    context_pairs = []
+
+    # Pass 1: batched translation (the ~10x request-count win).
+    idx = 0
+    while idx < n:
+        batch_texts = texts[idx: idx + TRANSLATION_BATCH_SIZE]
+        got = _translate_batch(client, system_content, context_pairs, batch_texts, target_language)
+        for j, tr in enumerate(got):
+            if tr:
+                full_translation[idx + j] = tr
+                context_pairs.append((batch_texts[j], tr))
+        context_pairs = context_pairs[-30:]
+        idx += len(batch_texts)
+
+    # Pass 2: fill any gap (unparseable/failed line) WITHOUT breaking order.
+    # Per-line strict retry -> minimal rescue prompt -> original text as last resort.
+    for pos in range(n):
+        if full_translation[pos] is not None:
+            continue
+        text = texts[pos]
+        tr = _translate_single(client, system_content, context_pairs, text, target_language)
+        if tr is None:
+            tr = _rescue_translate(client, text, target_language)
+        if tr is None:
+            logger.warning(
+                f'Translation failed for line {pos}: "{text[:60]}..." — using original text.'
+            )
+            tr = text
+        full_translation[pos] = tr
 
     return full_translation
 
