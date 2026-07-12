@@ -151,4 +151,11 @@ git clone https://github.com/shivammehta25/Matcha-TTS.git .
 
 本项目代码采用 [MIT License](LICENSE) 开源。
 
-> **注意**：项目支持的 TTS 引擎中，Coqui XTTS v2 的**模型权重**采用 [Coqui Public Model License (CPML)](https://coqui.ai/cpml)，仅允许非商业用途。如需商业用途，请使用 CosyVoice 引擎（Apache 2.0）或自行获取 XTTS v2 的商业授权。
+> **重要**：XTTS v2 在本项目中是 **opt-in 集成**——`youdub/step042_tts_xtts.py` **不会自动**从 HuggingFace / Coqui 下载 XTTS v2 模型权重（CPML 禁止再分发）。
+>
+> 如需启用 XTTS v2：
+>
+> 1. 自行从 [HuggingFace `coqui/XTTS-v2`](https://huggingface.co/coqui/XTTS-v2) 或 Coqui TTS 模型库下载权重，并**由您本人同意 CPML**；
+> 2. 设置环境变量 `OMNIDUB_XTTS_LOCAL_PATH=<权重本地目录>`，或在调用 `load_model(...)` / `tts(...)` 时显式传入 `model_path=<本地路径>`。
+>
+> 如需商用，建议改用 `tts_engine="cosyvoice"`（CosyVoice 300M，Apache 2.0），或自行向 Coqui 申请 XTTS v2 商业授权。详见 [https://coqui.ai/cpml](https://coqui.ai/cpml)。

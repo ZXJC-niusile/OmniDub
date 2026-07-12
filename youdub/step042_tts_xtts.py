@@ -10,6 +10,14 @@ import numpy as np
 import torch
 import time
 from .utils import save_wav, resolve_torch_device
+
+# CPML 合规：
+# OmniDub 不主动从 HuggingFace / Coqui 自动下载 XTTS v2 权重（CPML 禁止再分发）。
+# 启用 XTTS 必须由调用方自行：
+#   1) 自行从 HuggingFace / Coqui 下载权重并同意 CPML；
+#   2) 通过设置环境变量 OMNIDUB_XTTS_LOCAL_PATH=<本地权重目录>，
+#      或显式传入 model_path=<本地路径>。
+_XTTS_LOCAL_PATH_ENV = "OMNIDUB_XTTS_LOCAL_PATH"
 _models = {}
 _tts_locks = {}
 _models_lock = threading.Lock()
@@ -62,8 +70,17 @@ def _allowlist_unsupported_global_from_error(error_message: str) -> bool:
 def init_TTS():
     load_model()
     
-def load_model(model_path="tts_models/multilingual/multi-dataset/xtts_v2", device='auto'):
+def load_model(model_path=None, device='auto'):
     device = str(resolve_torch_device(device))
+    if model_path is None:
+        model_path = os.getenv(_XTTS_LOCAL_PATH_ENV)
+    if not model_path:
+        logger.info(
+            "XTTS v2 weights not configured: env %s unset and no model_path passed. "
+            "XTTS engine unavailable; to opt in see CPML note in step042_tts_xtts.py.",
+            _XTTS_LOCAL_PATH_ENV,
+        )
+        return None
     with _models_lock:
         existing = _models.get(device)
         if existing is not None:
@@ -116,8 +133,15 @@ def _is_cuda_runtime_error(error: Exception) -> bool:
     return any(marker in msg for marker in cuda_markers)
 
 
-def _get_cpu_model(model_name: str):
+def _get_cpu_model(model_name=None):
     global _cpu_model
+    if model_name is None:
+        model_name = os.getenv(_XTTS_LOCAL_PATH_ENV)
+    if not model_name:
+        raise RuntimeError(
+            "XTTS v2 CPU fallback unavailable: no model configured. "
+            f"Set env {_XTTS_LOCAL_PATH_ENV} or pass model_name explicitly."
+        )
     if _cpu_model is None:
         logger.warning('Initializing XTTS CPU fallback model...')
         with _torch_load_weights_compat():
@@ -125,12 +149,25 @@ def _get_cpu_model(model_name: str):
     return _cpu_model
 
 
-def tts(text, output_path, speaker_wav, model_name="tts_models/multilingual/multi-dataset/xtts_v2", device='auto', language='zh-cn'):
+def tts(text, output_path, speaker_wav, model_name=None, device='auto', language='zh-cn'):
     if os.path.exists(output_path):
         logger.info(f'TTS output already exists: {text}')
         return
+    if model_name is None:
+        model_name = os.getenv(_XTTS_LOCAL_PATH_ENV)
     device = str(resolve_torch_device(device))
     model = load_model(model_name, device)
+    if model is None:
+        raise RuntimeError(
+            "XTTS v2 模型未配置——OmniDub 不会自动下载 CPML 协议下的 XTTS 权重。\n"
+            "如需启用 XTTS：\n"
+            "  1. 自行从 https://huggingface.co/coqui/XTTS-v2 或 Coqui TTS 模型库下载权重，\n"
+            "     并由您本人同意 CPML 条款；\n"
+            "  2. 设置环境变量 OMNIDUB_XTTS_LOCAL_PATH=<权重本地目录>，或\n"
+            "     在调用 load_model / tts 时显式传入 model_path=<本地路径>。\n"
+            "如需商用，建议改用 tts_engine='cosyvoice'（Apache 2.0），或自行联系 Coqui "
+            "获取 XTTS v2 的商业授权。详见 https://coqui.ai/cpml"
+        )
     tts_lock = _tts_locks.setdefault(device, threading.Lock())
 
     last_error = None
