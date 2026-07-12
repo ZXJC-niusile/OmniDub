@@ -43,6 +43,12 @@ from .step050_synthesize_video import synthesize_video
 from .step060_genrate_info import generate_info
 from .utils import pick_cuda_devices_for_workers
 
+try:
+    from .utils import compute_fingerprint, should_skip_step
+except ImportError:
+    compute_fingerprint = None
+    should_skip_step = None
+
 
 # ── configuration ─────────────────────────────────────────────────────
 @dataclass
@@ -141,27 +147,65 @@ def _cache_audio(folder: str) -> bool:
     return os.path.isfile(audio_path) and os.path.getsize(audio_path) > 1024
 
 
-def _cache_vocals(folder: str) -> bool:
-    return (
-        _file_exists(os.path.join(folder, "audio_vocals.wav"))
-        and _file_exists(os.path.join(folder, "audio_instruments.wav"))
-    )
+def _step_cached(folder: str, step_name: str, params: dict, output_paths: list[str]) -> bool:
+    """Wrapper that uses the parameter-aware ``should_skip_step`` when available,
+    falling back to plain file-existence checks otherwise."""
+    if should_skip_step is None:
+        return all(_file_exists(p) for p in output_paths)
+    return should_skip_step(folder, step_name, params, output_paths)
 
 
-def _cache_transcript(folder: str) -> bool:
-    return _file_exists(os.path.join(folder, "transcript.json"))
+def _cache_vocals(folder: str, cfg: PipelineConfig) -> bool:
+    return _step_cached(folder, 'step010_demucs', {
+        'demucs_model': cfg.demucs_model,
+        'demucs_shifts': cfg.demucs_shifts,
+        'device': str(cfg.demucs_device),
+    }, [
+        os.path.join(folder, 'audio_vocals.wav'),
+        os.path.join(folder, 'audio_instruments.wav'),
+    ])
 
 
-def _cache_translation(folder: str) -> bool:
-    return _file_exists(os.path.join(folder, "translation.json"))
+def _cache_transcript(folder: str, cfg: PipelineConfig) -> bool:
+    return _step_cached(folder, 'step020_whisperx', {
+        'whisper_model': cfg.whisper_model,
+        'whisper_batch_size': cfg.whisper_batch_size,
+        'source_language': cfg.source_language,
+        'whisper_diarization': cfg.whisper_diarization,
+    }, [
+        os.path.join(folder, 'transcript.json'),
+    ])
 
 
-def _cache_tts(folder: str) -> bool:
-    return _file_exists(os.path.join(folder, "audio_combined.wav"))
+def _cache_translation(folder: str, cfg: PipelineConfig) -> bool:
+    return _step_cached(folder, 'step030_translation', {
+        'translation_target_language': cfg.translation_target_language,
+        'model_name': os.getenv('MODEL_NAME', 'gpt-3.5-turbo'),
+        'tbatch': os.getenv('TRANSLATION_BATCH_SIZE', '10'),
+    }, [
+        os.path.join(folder, 'translation.json'),
+    ])
 
 
-def _cache_video(folder: str) -> bool:
-    return _file_exists(os.path.join(folder, "video.mp4"))
+def _cache_tts(folder: str, cfg: PipelineConfig) -> bool:
+    return _step_cached(folder, 'step040_tts', {
+        'tts_engine': cfg.tts_engine,
+        'formation_tts_style': os.getenv('FORMATION_TTS_STYLE', 'chinese_compact'),
+        'tts_device': str(cfg.tts_device),
+    }, [
+        os.path.join(folder, 'audio_combined.wav'),
+    ])
+
+
+def _cache_video(folder: str, cfg: PipelineConfig) -> bool:
+    return _step_cached(folder, 'step050_synthesize_video', {
+        'subtitles': cfg.subtitles,
+        'speed_up': cfg.speed_up,
+        'fps': cfg.fps,
+        'target_resolution': cfg.target_resolution,
+    }, [
+        os.path.join(folder, 'video.mp4'),
+    ])
 
 
 # ── model warm-up ─────────────────────────────────────────────────────
@@ -200,7 +244,7 @@ def _run_pipeline(folder: str, cfg: PipelineConfig) -> None:
     logger.info(f"[Pipeline] START  folder={folder}")
 
     # ── Step 1: extract audio + vocal separation ──────────────────────
-    if not _cache_vocals(folder):
+    if not _cache_vocals(folder, cfg):
         if not _cache_audio(folder):
             logger.info("[Step 1] Extracting audio from video ...")
             extract_audio_from_video(folder)
@@ -216,7 +260,7 @@ def _run_pipeline(folder: str, cfg: PipelineConfig) -> None:
         logger.info("[Step 1] SKIP — vocals already separated")
 
     # ── Step 2: speech recognition ────────────────────────────────────
-    if not _cache_transcript(folder):
+    if not _cache_transcript(folder, cfg):
         logger.info("[Step 2] Transcribing speech ...")
         transcribe_audio(
             folder,
@@ -233,21 +277,21 @@ def _run_pipeline(folder: str, cfg: PipelineConfig) -> None:
         logger.info("[Step 2] SKIP — transcript already exists")
 
     # ── Step 3: translation ───────────────────────────────────────────
-    if not _cache_translation(folder):
+    if not _cache_translation(folder, cfg):
         logger.info("[Step 3] Translating subtitles ...")
         translate(folder, target_language=cfg.translation_target_language)
     else:
         logger.info("[Step 3] SKIP — translation already cached")
 
     # ── Step 4: TTS ───────────────────────────────────────────────────
-    if not _cache_tts(folder):
+    if not _cache_tts(folder, cfg):
         logger.info("[Step 4] Generating TTS audio ...")
         generate_wavs(folder, tts_engine=cfg.tts_engine, tts_device=cfg.tts_device)
     else:
         logger.info("[Step 4] SKIP — TTS audio already generated")
 
     # ── Step 5: video compositing ─────────────────────────────────────
-    if not _cache_video(folder):
+    if not _cache_video(folder, cfg):
         logger.info("[Step 5] Compositing final video ...")
         synthesize_video(
             folder,
@@ -322,6 +366,7 @@ def process_online_video(
     burn_subtitles: bool = True,
     speed_up: float = 1.05,
     max_workers: int = 1,
+    xtts_cpml_ack: bool = False,
 ) -> str:
     """
     Full pipeline for one or more online video URLs.
@@ -330,6 +375,10 @@ def process_online_video(
     ----------
     url : str
         One URL or multiple URLs separated by commas / newlines.
+    xtts_cpml_ack : bool, default False
+        Defence-in-depth CPML acknowledgment. The Gradio UI also enforces this
+        gate; passing True here is required to use ``tts_engine='xtts'`` from
+        any caller (CLI, script, notebook).
     **overrides
         Any field of ``PipelineConfig`` to override the defaults.
 
@@ -348,6 +397,19 @@ def process_online_video(
         speed_up=speed_up,
         max_workers=max(1, int(max_workers)),
     )
+
+    if cfg.tts_engine == 'xtts' and not xtts_cpml_ack:
+        logger.error('XTTS v2 requires CPML non-commercial acknowledgment. Aborting.')
+        raise ValueError(
+            'XTTS v2 requires explicit CPML acknowledgment. '
+            'Set xtts_cpml_ack=True or switch tts_engine to "cosyvoice". '
+            'See https://coqui.ai/cpml'
+        )
+    if cfg.tts_engine == 'xtts':
+        logger.warning(
+            'XTTS v2 is licensed under CPML — non-commercial use only. '
+            'See https://coqui.ai/cpml'
+        )
 
     urls = _parse_multi_input(url)
     if not urls:
@@ -409,6 +471,7 @@ def process_local_video(
     burn_subtitles: bool = True,
     speed_up: float = 1.05,
     max_workers: int = 1,
+    xtts_cpml_ack: bool = False,
 ) -> str:
     """
     Full pipeline for a local video file.
@@ -417,6 +480,10 @@ def process_local_video(
     ----------
     file_path : str
         Absolute or relative path to a local video file.
+    xtts_cpml_ack : bool, default False
+        Defence-in-depth CPML acknowledgment. The Gradio UI also enforces this
+        gate; passing True here is required to use ``tts_engine='xtts'`` from
+        any caller (CLI, script, notebook).
     **overrides
         Any field of ``PipelineConfig`` to override the defaults.
 
@@ -433,6 +500,19 @@ def process_local_video(
         speed_up=speed_up,
         max_workers=max(1, int(max_workers)),
     )
+
+    if cfg.tts_engine == 'xtts' and not xtts_cpml_ack:
+        logger.error('XTTS v2 requires CPML non-commercial acknowledgment. Aborting.')
+        raise ValueError(
+            'XTTS v2 requires explicit CPML acknowledgment. '
+            'Set xtts_cpml_ack=True or switch tts_engine to "cosyvoice". '
+            'See https://coqui.ai/cpml'
+        )
+    if cfg.tts_engine == 'xtts':
+        logger.warning(
+            'XTTS v2 is licensed under CPML — non-commercial use only. '
+            'See https://coqui.ai/cpml'
+        )
 
     _warm_up_models()
 
