@@ -2,10 +2,11 @@
 import json
 import os
 import re
-from openai import OpenAI
-from dotenv import load_dotenv
 import time
+
+from dotenv import load_dotenv
 from loguru import logger
+from openai import OpenAI
 
 load_dotenv()
 
@@ -21,6 +22,19 @@ try:
 except ValueError:
     TRANSLATION_BATCH_SIZE = 10
 
+_CJK_TARGET_LANGUAGES = {'简体中文', '繁体中文', 'zh', 'zh-cn', 'zh-tw', 'zh-hans', 'zh-hant'}
+
+
+def _is_chinese_target(target_language: str) -> bool:
+    return str(target_language or '').strip().lower() in {x.lower() for x in _CJK_TARGET_LANGUAGES}
+
+
+def _contains_cjk_or_kana(text: str) -> bool:
+    return any(
+        ('\u4e00' <= ch <= '\u9fff') or ('\u3040' <= ch <= '\u30ff') or ('\uac00' <= ch <= '\ud7af')
+        for ch in (text or '')
+    )
+
 
 def get_necessary_info(info: dict):
     return {
@@ -34,9 +48,9 @@ def get_necessary_info(info: dict):
 
 
 def ensure_transcript_length(transcript, max_length=4000):
-    mid = len(transcript)//2
+    mid = len(transcript) // 2
     before, after = transcript[:mid], transcript[mid:]
-    length = max_length//2
+    length = max_length // 2
     return before[:length] + after[-length:]
 
 
@@ -44,14 +58,12 @@ def _extract_json_object(text: str):
     if not text:
         raise ValueError('Empty model response')
     cleaned = text.strip()
-    # Try direct JSON object first.
     try:
         obj = json.loads(cleaned)
         if isinstance(obj, dict):
             return obj
     except Exception:
         pass
-    # Fallback: extract first {...} block.
     match = re.search(r'\{[\s\S]*\}', cleaned)
     if not match:
         raise ValueError(f'No JSON object found in response: {cleaned[:200]}')
@@ -105,33 +117,24 @@ def _format_api_exception(e: Exception):
 
 
 def _get_response_text(response):
-    """Safely extract text content from an OpenAI-compatible response object.
+    """Safely extract single-line text content from an OpenAI-compatible response object."""
+    return _get_response_text_multiline(response).replace('\n', '')
 
-    Defensive: never raises ``NoneType is not subscriptable`` — every level
-    of the response hierarchy is checked before access.
-    """
+
+def _get_response_text_multiline(response):
+    """Safely extract text content while preserving newlines (needed for numbered batches)."""
     if response is None:
         raise ValueError('Model response is None (API returned nothing).')
-
     choices = getattr(response, 'choices', None)
     if not choices or not isinstance(choices, list) or len(choices) == 0:
-        raise ValueError(
-            f'Model response has no choices. snapshot={_response_snapshot(response)}'
-        )
-
-    first_choice = choices[0]
-    message = getattr(first_choice, 'message', None)
+        raise ValueError(f'Model response has no choices. snapshot={_response_snapshot(response)}')
+    message = getattr(choices[0], 'message', None)
     if message is None:
-        raise ValueError(
-            f'Model response first choice has no message. snapshot={_response_snapshot(response)}'
-        )
-
+        raise ValueError(f'Model response first choice has no message. snapshot={_response_snapshot(response)}')
     content = getattr(message, 'content', None)
     if content is None:
-        raise ValueError(
-            f'Model response content is empty. snapshot={_response_snapshot(response)}'
-        )
-    return str(content).replace('\n', '')
+        raise ValueError(f'Model response content is empty. snapshot={_response_snapshot(response)}')
+    return str(content)
 
 
 def summarize(info, transcript, target_language='简体中文'):
@@ -154,9 +157,6 @@ def summarize(info, transcript, target_language='简体中文'):
         'in JSON format.\n```json\n{"title": "the title of the video", '
         '"summary": "the summary of the video"}\n```'
     )
-    # Constant format reminder reused on every retry. The old code appended the
-    # same template to `retry_message` on each failure, which grew the prompt
-    # unboundedly without adding any new information to the model.
     format_hint = '\nSummarize the video in JSON format:\n```json\n{"title": "", "summary": ""}\n```'
 
     # Phase 1: produce source-language summary as a JSON object with stable keys.
@@ -182,8 +182,8 @@ def summarize(info, transcript, target_language='简体中文'):
                 raise ValueError(f'Invalid summary json keys: {list(parsed.keys())}')
             cleaned_title = str(parsed['title']).replace('title:', '').strip()
             cleaned_summary = str(parsed['summary']).replace('summary:', '').strip()
-            if 'title' in cleaned_title:
-                raise Exception('Invalid summary')
+            if 'title' in cleaned_title.lower() and cleaned_title.lower().startswith('the title'):
+                raise ValueError('Invalid placeholder summary')
             summary_obj = {'title': cleaned_title, 'summary': cleaned_summary}
             break
         except Exception as e:
@@ -191,7 +191,7 @@ def summarize(info, transcript, target_language='简体中文'):
             time.sleep(1)
 
     if summary_obj is None:
-        raise Exception('Summary generation failed: max retries exceeded')
+        raise RuntimeError('Summary generation failed: max retries exceeded')
 
     # Phase 2: translate the (title, summary, tags) tuple into target_language.
     title_en = summary_obj['title']
@@ -233,17 +233,13 @@ def summarize(info, transcript, target_language='简体中文'):
             translation = _extract_json_object(raw)
             if 'title' not in translation or 'summary' not in translation or 'tags' not in translation:
                 raise ValueError(f'Invalid translation json keys: {list(translation.keys())}')
-            if target_language in translation['title'] or target_language in translation['summary']:
-                raise Exception('Invalid translation')
+            if f'the {target_language} title' in str(translation['title']):
+                raise ValueError('Invalid placeholder translation')
             translated_title = str(translation['title']).strip()
-            if (
-                (translated_title.startswith('"') and translated_title.endswith('"'))
-                or (translated_title.startswith('“') and translated_title.endswith('”'))
-                or (translated_title.startswith('‘') and translated_title.endswith('’'))
-                or (translated_title.startswith("'") and translated_title.endswith("'"))
-                or (translated_title.startswith('《') and translated_title.endswith('》'))
-            ):
-                translated_title = translated_title[1:-1]
+            for lq, rq in (('"', '"'), ('“', '”'), ('‘', '’'), ("'", "'"), ('《', '》')):
+                if len(translated_title) >= 2 and translated_title.startswith(lq) and translated_title.endswith(rq):
+                    translated_title = translated_title[1:-1]
+                    break
             return {
                 'title': translated_title,
                 'author': info['uploader'],
@@ -254,95 +250,117 @@ def summarize(info, transcript, target_language='简体中文'):
         except Exception as e:
             logger.warning(f'Translation summary failed (attempt {retry + 1}/10): {e}')
             time.sleep(1)
-    raise Exception('Translation summary failed: max retries exceeded')
+    raise RuntimeError('Translation summary failed: max retries exceeded')
 
 
-def translation_postprocess(result):
-    result = re.sub(r'\（[^)]*\）', '', result)
+def translation_postprocess(result, target_language='简体中文'):
+    result = (result or '').strip()
+    if not _is_chinese_target(target_language):
+        return re.sub(r'(?<=\d),(?=\d)', '', result)
+
+    result = re.sub(r'[（\(][^）\)]*[）\)]', '', result).strip() or result
     result = result.replace('...', '，')
     result = re.sub(r'(?<=\d),(?=\d)', '', result)
-    result = result.replace('²', '的平方').replace(
-        '————', '：').replace('——', '：').replace('°', '度')
-    # Word-boundary-aware "AI" -> 人工智能: the old blind replace corrupted any
-    # surviving English token containing "AI" (TRAIN/AIR/product names).
+    result = (
+        result.replace('²', '的平方')
+        .replace('————', '：')
+        .replace('——', '：')
+        .replace('°', '度')
+    )
+    # Word-boundary-aware "AI" -> 人工智能: avoids corrupting tokens like TRAIN/AIR.
     result = re.sub(r'(?<![A-Za-z0-9])AI(?![A-Za-z0-9])', '人工智能', result)
-    # NOTE: removed the blind '变压器'->'Transformer' swap — it corrupted genuine
-    # mentions of electrical transformers. ML-term fidelity is now steered by the
-    # translation prompt glossary instead of post-hoc string surgery.
-    return result
+    return result.strip()
 
-def valid_translation(text, translation):
-    
-    if (translation.startswith('```') and translation.endswith('```')):
-        translation = translation[3:-3]
-        return True, translation_postprocess(translation)
-    
-    if (translation.startswith('“') and translation.endswith('”')) or (translation.startswith('"') and translation.endswith('"')):
-        translation = translation[1:-1]
-        return True, translation_postprocess(translation)
-    
-    if '翻译' in translation and '：“' in translation and '”' in translation:
-        translation = translation.split('：“')[-1].split('”')[0]
-        return True, translation_postprocess(translation)
-    
-    if '翻译' in translation and '："' in translation and '"' in translation:
-        translation = translation.split('："')[-1].split('"')[0]
-        return True, translation_postprocess(translation)
 
-    if '翻译' in translation and ':"' in translation and '"' in translation:
-        translation = translation.split(':"')[-1].split('"')[0]
-        return True, translation_postprocess(translation)
-    
-    if len(text) <= 10:
-        if len(translation) > 15:
-            return False, f'Only translate the following sentence and give me the result.'
-    elif len(translation) > len(text)*0.75:
-        return False, f'The translation is too long. Only translate the following sentence and give me the result.'
-    
-    forbidden = ['翻译', '这句', '\n', '简体中文', '中文', 'translate', 'Translate', 'translation', 'Translation']
-    translation = translation.strip()
-    for word in forbidden:
-        if word in translation:
-            
-            return False, f"Don't include `{word}` in the translation. Only translate the following sentence and give me the result."
-    
-    return True, translation_postprocess(translation)
+def valid_translation(text, translation, target_language='简体中文'):
+    translation = (translation or '').strip()
+    if translation.startswith('```') and translation.endswith('```'):
+        translation = translation[3:-3].strip()
+        return bool(translation), translation_postprocess(translation, target_language)
+
+    for prefix in ('翻译：“', '翻译："', '翻译:"', 'Translation: "', 'Translation:"'):
+        if prefix in translation:
+            tail = translation.split(prefix, 1)[-1]
+            closing = '”' if prefix.endswith('“') else '"'
+            if closing in tail:
+                extracted = tail.split(closing, 1)[0].strip()
+                if extracted:
+                    return True, translation_postprocess(extracted, target_language)
+
+    for lq, rq in (('“', '”'), ('"', '"')):
+        if len(translation) >= 2 and translation.startswith(lq) and translation.endswith(rq):
+            inner = translation[1:-1].strip()
+            if inner:
+                return True, translation_postprocess(inner, target_language)
+
+    if not translation:
+        return False, 'Empty translation. Output only the translated sentence.'
+
+    # Language-aware length sanity check to reject verbose model chatter without
+    # penalizing valid translations into longer alphabetic languages (EN/DE/FR/RU).
+    if _is_chinese_target(target_language) and not _contains_cjk_or_kana(text):
+        max_allowed = 20 if len(text) <= 10 else max(25, int(len(text) * 1.2))
+    else:
+        max_allowed = max(80, len(text) * 6)
+
+    if len(translation) > max_allowed:
+        return False, 'The translation is too long. Only translate the sentence and output nothing else.'
+
+    if '\n' in translation:
+        return False, 'Do not include newlines. Output only the translated sentence.'
+
+    meta_markers = ['翻译：', '译文：', '这句', '简体中文', '繁体中文', 'Translation:']
+    src_lower = (text or '').lower()
+    for marker in meta_markers:
+        if marker in translation and marker.lower() not in src_lower:
+            return False, f"Don't include `{marker}` in the output. Output only the translation."
+
+    return True, translation_postprocess(translation, target_language)
+
+
 def split_text_into_sentences(para):
-    para = re.sub(r'([。！？\?])([^，。！？\?”’》])', r"\1\n\2", para)  # 单字符断句符
-    para = re.sub(r'(\.{6})([^，。！？\?”’》])', r"\1\n\2", para)  # 英文省略号
-    para = re.sub(r'(\…{2})([^，。！？\?”’》])', r"\1\n\2", para)  # 中文省略号
+    if not para:
+        return []
+    para = re.sub(r'([。！？\?])([^，。！？\?”’》])', r"\1\n\2", para)
+    para = re.sub(r'(\.{6})([^，。！？\?”’》])', r"\1\n\2", para)
+    para = re.sub(r'(\…{2})([^，。！？\?”’》])', r"\1\n\2", para)
     para = re.sub(r'([。！？\?][”’])([^，。！？\?”’》])', r'\1\n\2', para)
-    # 如果双引号前有终止符，那么双引号才是句子的终点，把分句符\n放到双引号后，注意前面的几句都小心保留了双引号
-    para = para.rstrip()  # 段尾如果有多余的\n就去掉它
-    # 很多规则中会考虑分号;，但是这里我把它忽略不计，破折号、英文双引号等同样忽略，需要的再做些简单调整即可。
-    return para.split("\n")
+    para = para.rstrip()
+    return [s.strip() for s in para.split("\n") if s and s.strip()]
+
 
 def split_sentences(translation):
     output_data = []
     for item in translation:
-        start = item['start']
-        text = item['text']
-        speaker = item['speaker']
-        translation_text = item['translation']
+        start = float(item['start'])
+        end = float(item['end'])
+        text = item.get('text', '')
+        speaker = item.get('speaker', 'SPEAKER_00')
+        translation_text = (item.get('translation') or '').strip()
+        if not translation_text:
+            translation_text = (text or '').strip()
+        if not translation_text:
+            continue
+
         sentences = split_text_into_sentences(translation_text)
-        duration_per_char = (item['end'] - item['start']
-                             ) / len(translation_text)
+        if not sentences:
+            sentences = [translation_text]
+
+        total_chars = max(1, sum(len(s) for s in sentences))
+        duration_per_char = max(0.0, end - start) / total_chars
         for sentence in sentences:
             sentence_end = start + duration_per_char * len(sentence)
-
-            # Append the new item
             output_data.append({
                 "start": round(start, 3),
                 "end": round(sentence_end, 3),
                 "text": text,
                 "speaker": speaker,
-                "translation": sentence
+                "translation": sentence,
             })
-
-            # Advance start for the next sentence in this item
             start = sentence_end
     return output_data
-    
+
+
 def _make_client():
     return OpenAI(
         base_url=os.getenv('OPENAI_API_BASE', 'https://api.openai.com/v1'),
@@ -351,43 +369,30 @@ def _make_client():
 
 
 def _translation_system_content(info, target_language):
-    # Shared guidance for batch / single-line / rescue paths. The glossary keeps
-    # ML terms intact (e.g. "Transformer" must NOT become the electrical "变压器"),
-    # replacing the old blind post-hoc string swaps.
+    if _is_chinese_target(target_language):
+        return (
+            f'You are a expert in the field of this video.\n{info}\n'
+            f'Translate into {target_language}. 请充当翻译家，把内容翻译得自然、流畅、地道，'
+            f'不要翻译腔，使用优美高雅的表达。术语要求：人工智能中的"agent"译为"智能体"；'
+            f'强化学习中是`Q-Learning`而非`Queue Learning`；深度学习语境下的"Transformer"是'
+            f'模型架构名，保持英文"Transformer"，不要译成"变压器"；专有名词、产品名、代码标识符'
+            f'保持原文。数学公式写成 plain text，不要用 latex。确保准确、简洁，注意信达雅。'
+        )
     return (
-        f'You are a expert in the field of this video.\n{info}\n'
-        f'Translate into {target_language}. 请充当翻译家，把内容翻译得自然、流畅、地道，'
-        f'不要翻译腔，使用优美高雅的表达。术语要求：人工智能中的"agent"译为"智能体"；'
-        f'强化学习中是`Q-Learning`而非`Queue Learning`；深度学习语境下的"Transformer"是'
-        f'模型架构名，保持英文"Transformer"，不要译成"变压器"；专有名词、产品名、代码标识符'
-        f'保持原文。数学公式写成 plain text，不要用 latex。确保准确、简洁，注意信达雅。'
+        f'You are an expert translator in the domain of this video.\n{info}\n'
+        f'Translate accurately, naturally, and idiomatically into {target_language}. '
+        f'Keep proper nouns, product names, code identifiers, and technical acronyms '
+        f'(such as Transformer, Q-Learning) intact where appropriate. '
+        f'Write math expressions as plain text without LaTeX.'
     )
-
-
-def _get_response_text_multiline(response):
-    """Like _get_response_text but preserves newlines (needed to parse the
-    numbered batch format, which _get_response_text would flatten)."""
-    if response is None:
-        raise ValueError('Model response is None (API returned nothing).')
-    choices = getattr(response, 'choices', None)
-    if not choices or not isinstance(choices, list) or len(choices) == 0:
-        raise ValueError(f'Model response has no choices. snapshot={_response_snapshot(response)}')
-    message = getattr(choices[0], 'message', None)
-    if message is None:
-        raise ValueError(f'Model response first choice has no message. snapshot={_response_snapshot(response)}')
-    content = getattr(message, 'content', None)
-    if content is None:
-        raise ValueError(f'Model response content is empty. snapshot={_response_snapshot(response)}')
-    return str(content)
 
 
 _BATCH_LINE_RE = re.compile(r'^\s*[\[\(]?(\d+)[\]\)]?\s*[\.、:：\)）]\s*(.*\S)\s*$')
 
 
-def _parse_numbered_batch(reply, expected):
+def _parse_numbered_batch(reply, expected, target_language='简体中文'):
     """Parse a numbered reply into a list of length ``expected``; each slot is
-    the translation for that 1-based index or ``None`` if missing/unparseable.
-    Tolerant of extra prose lines and of quote wrapping."""
+    the translation for that 1-based index or ``None`` if missing/unparseable."""
     parsed = {}
     for raw in reply.splitlines():
         m = _BATCH_LINE_RE.match(raw)
@@ -401,37 +406,31 @@ def _parse_numbered_batch(reply, expected):
                     val = val[1:-1].strip()
                     break
             if val:
-                parsed[i] = translation_postprocess(val)
+                parsed[i] = translation_postprocess(val, target_language)
     return [parsed.get(i + 1) for i in range(expected)]
 
 
 def _translate_batch(client, system_content, context_pairs, batch_texts, target_language, max_retries=3):
-    """Translate a batch of lines in ONE call. Returns a list aligned to
-    ``batch_texts`` with ``None`` for any line not confidently obtained. Retries
-    the whole batch up to ``max_retries`` times, merging partial results.
-    On retries 2+ the user prompt adds a format emphasis to break out of the
-    case where the model locked onto a malformed output pattern."""
     n = len(batch_texts)
     merged = [None] * n
 
     context_block = ''
     if context_pairs:
         refs = '\n'.join(f'- {s[:40]} => {d[:40]}' for s, d in context_pairs[-5:])
-        context_block = f'已翻译片段（仅供术语一致性参考，不要重复输出）：\n{refs}\n\n'
+        context_block = f'Previous translations (for terminology consistency only, do NOT repeat):\n{refs}\n\n'
 
     numbered = '\n'.join(f'{i + 1}. {t}' for i, t in enumerate(batch_texts))
     base_user_content = (
-        f'{context_block}把下面 {n} 行分别翻译成{target_language}，保持行的顺序与数量。'
-        f'只输出 {n} 行，每行格式为 `序号. 译文`，不要合并或拆分行，不要额外解释。\n\n{numbered}'
+        f'{context_block}Translate each of the {n} numbered lines below into {target_language}, '
+        f'preserving exact line order and line count. Output ONLY {n} lines formatted as `index. translation` '
+        f'(do not merge or split lines, no extra commentary).\n\n{numbered}'
     )
     format_emphasis = (
-        '\n注意：严格按 `数字 + 半角点 + 空格 + 译文` 一行一条输出，不要使用项目符号、'
-        '不要加粗、不要写说明文字、不要代码块包裹。'
+        f'\nIMPORTANT: Strictly output `{n}` lines as `number. translation` (ASCII period + space), '
+        'no bullet points, no bold formatting, no code fences, and no explanations.'
     )
 
     for attempt in range(max_retries):
-        # Vary the prompt on retries: identical prompts keep producing identical
-        # failures, so add format reinforcement starting from the 2nd try.
         user_content = base_user_content if attempt == 0 else base_user_content + format_emphasis
         messages = [
             {'role': 'system', 'content': system_content},
@@ -444,7 +443,9 @@ def _translate_batch(client, system_content, context_pairs, batch_texts, target_
                 )
             except Exception as api_e:
                 raise RuntimeError(f'chat.completions.create failed: {_format_api_exception(api_e)}')
-            got = _parse_numbered_batch(_get_response_text_multiline(response), n)
+            got = _parse_numbered_batch(
+                _get_response_text_multiline(response), n, target_language=target_language
+            )
             for j in range(n):
                 if merged[j] is None and got[j]:
                     merged[j] = got[j]
@@ -458,17 +459,31 @@ def _translate_batch(client, system_content, context_pairs, batch_texts, target_
 
 def _translate_single(client, system_content, context_pairs, text, target_language, max_retries=10):
     """Per-line translation with strict validation. Returns str or None."""
+    is_zh = _is_chinese_target(target_language)
     history = []
     for s, d in context_pairs[-10:]:
         history.append({'role': 'user', 'content': f'Translate:"{s}"'})
-        history.append({'role': 'assistant', 'content': f'翻译：“{d}”'})
-    few_shot = [
-        {'role': 'user', 'content': '使用地道的中文Translate:"Knowledge is power."'},
-        {'role': 'assistant', 'content': '翻译：“知识就是力量。”'},
-    ]
+        if is_zh:
+            history.append({'role': 'assistant', 'content': f'翻译：“{d}”'})
+        else:
+            history.append({'role': 'assistant', 'content': f'Translation: "{d}"'})
+
+    if is_zh:
+        few_shot = [
+            {'role': 'user', 'content': f'使用地道的{target_language}Translate:"Knowledge is power."'},
+            {'role': 'assistant', 'content': '翻译：“知识就是力量。”'},
+        ]
+        user_prompt = f'使用地道的{target_language}Translate:"{text}"'
+    else:
+        few_shot = [
+            {'role': 'user', 'content': f'Translate into {target_language}: "Knowledge is power."'},
+            {'role': 'assistant', 'content': f'Translation: "Knowledge is power."'},
+        ]
+        user_prompt = f'Translate into {target_language} (output ONLY `Translation: "..."`): "{text}"'
+
     for _ in range(max_retries):
         messages = [{'role': 'system', 'content': system_content}] + few_shot + history + [
-            {'role': 'user', 'content': f'使用地道的中文Translate:"{text}"'}
+            {'role': 'user', 'content': user_prompt}
         ]
         try:
             try:
@@ -477,7 +492,9 @@ def _translate_single(client, system_content, context_pairs, text, target_langua
                 )
             except Exception as api_e:
                 raise RuntimeError(f'chat.completions.create failed: {_format_api_exception(api_e)}')
-            ok, translation = valid_translation(text, _get_response_text(response))
+            ok, translation = valid_translation(
+                text, _get_response_text(response), target_language=target_language
+            )
             if ok:
                 return translation
         except Exception as e:
@@ -487,16 +504,18 @@ def _translate_single(client, system_content, context_pairs, text, target_langua
 
 
 def _rescue_translate(client, text, target_language):
-    """Last-ditch minimal-prompt translation (no history) so an exhausted line
-    is rescued into the target language instead of leaking the source text.
-    Returns str or None."""
+    """Last-ditch minimal-prompt translation (no history)."""
     try:
         response = client.chat.completions.create(
             model=model_name,
             messages=[
-                {'role': 'user',
-                 'content': f'Translate the following into {target_language}. '
-                            f'Output only the translation, nothing else:\n"{text}"'}
+                {
+                    'role': 'user',
+                    'content': (
+                        f'Translate the following into {target_language}. '
+                        f'Output only the translation, nothing else:\n"{text}"'
+                    ),
+                }
             ],
             timeout=240,
             extra_body=extra_body,
@@ -506,7 +525,7 @@ def _rescue_translate(client, text, target_language):
             if len(out) >= 2 and out.startswith(lq) and out.endswith(rq):
                 out = out[1:-1].strip()
                 break
-        return translation_postprocess(out) if out else None
+        return translation_postprocess(out, target_language) if out else None
     except Exception as e:
         logger.error(f'rescue translate failed: {e}')
         return None
@@ -518,12 +537,11 @@ def _translate(summary, transcript, target_language='简体中文'):
     system_content = _translation_system_content(info, target_language)
     n = len(transcript)
     texts = [line['text'] for line in transcript]
-    full_translation = [None] * n  # index-aligned; guarantees order + length
+    full_translation = [None] * n
 
-    # Rolling (src, dst) context so terminology stays consistent across batches.
     context_pairs = []
 
-    # Pass 1: batched translation (the ~10x request-count win).
+    # Pass 1: batched translation (~10x fewer API requests).
     idx = 0
     while idx < n:
         batch_texts = texts[idx: idx + TRANSLATION_BATCH_SIZE]
@@ -535,8 +553,7 @@ def _translate(summary, transcript, target_language='简体中文'):
         context_pairs = context_pairs[-30:]
         idx += len(batch_texts)
 
-    # Pass 2: fill any gap (unparseable/failed line) WITHOUT breaking order.
-    # Per-line strict retry -> minimal rescue prompt -> original text as last resort.
+    # Pass 2: fill any gap without breaking order.
     for pos in range(n):
         if full_translation[pos] is not None:
             continue
@@ -553,8 +570,10 @@ def _translate(summary, transcript, target_language='简体中文'):
 
     return full_translation
 
+
 def translate(folder, target_language='简体中文'):
-    if os.path.exists(os.path.join(folder, 'translation.json')):
+    translation_path = os.path.join(folder, 'translation.json')
+    if os.path.isfile(translation_path) and os.path.getsize(translation_path) > 0:
         logger.info(f'Translation already exists in {folder}')
         return True
 
@@ -578,36 +597,39 @@ def translate(folder, target_language='简体中文'):
         logger.warning(f'{info_path} not found, generated local metadata automatically.')
 
     transcript_path = os.path.join(folder, 'transcript.json')
+    if not os.path.isfile(transcript_path):
+        raise FileNotFoundError(f'Transcript not found: {transcript_path}')
     with open(transcript_path, 'r', encoding='utf-8') as f:
         transcript = json.load(f)
 
     if not transcript or not isinstance(transcript, list):
-        logger.error(f'Invalid or empty transcript in {folder}')
-        return False
+        raise RuntimeError(f'Invalid or empty transcript in {folder}')
 
     summary_path = os.path.join(folder, 'summary.json')
+    summary = None
     if os.path.exists(summary_path):
         try:
             with open(summary_path, 'r', encoding='utf-8') as f:
-                summary = json.load(f)
-            if not isinstance(summary, dict) or 'title' not in summary:
-                raise ValueError('summary.json missing required keys')
+                cached_summary = json.load(f)
+            if (
+                isinstance(cached_summary, dict)
+                and 'title' in cached_summary
+                and cached_summary.get('language', target_language) == target_language
+            ):
+                summary = cached_summary
         except Exception as e:
             logger.warning(f'Corrupt summary.json, regenerating: {e}')
-            summary = summarize(info, transcript, target_language)
-    else:
-        summary = summarize(info, transcript, target_language)
 
     if summary is None:
-        logger.error(f'Failed to summarize {folder}')
-        return False
-    with open(summary_path, 'w', encoding='utf-8') as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
+        summary = summarize(info, transcript, target_language)
+        if summary is None:
+            raise RuntimeError(f'Failed to summarize {folder}')
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
 
-    translation_path = os.path.join(folder, 'translation.json')
     translation = _translate(summary, transcript, target_language)
 
-    # Defensive: pad or trim translation list to match transcript length.
+    # Defensive: pad or trim translation list to match transcript length without mutating originals.
     if len(translation) < len(transcript):
         logger.warning(
             f'Translation has {len(translation)} items but transcript has {len(transcript)}. '
@@ -621,10 +643,13 @@ def translate(folder, target_language='简体中文'):
         )
         translation = translation[:len(transcript)]
 
+    translated_items = []
     for i, line in enumerate(transcript):
-        line['translation'] = translation[i]
-    transcript = split_sentences(transcript)
-    with open(translation_path, 'w', encoding='utf-8') as f:
-        json.dump(transcript, f, indent=2, ensure_ascii=False)
-    return True
+        entry = dict(line)
+        entry['translation'] = translation[i]
+        translated_items.append(entry)
 
+    split_items = split_sentences(translated_items)
+    with open(translation_path, 'w', encoding='utf-8') as f:
+        json.dump(split_items, f, indent=2, ensure_ascii=False)
+    return True
