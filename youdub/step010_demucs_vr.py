@@ -1,58 +1,76 @@
-from demucs.api import Separator
 import os
 import subprocess
 import threading
-import wave
-from loguru import logger
 import time
-from .utils import save_wav, resolve_torch_device
-import torch
+import wave
+
+from demucs.api import Separator
+from loguru import logger
+
+from .utils import resolve_torch_device, save_wav
+
 _separators = {}
 _separator_locks = {}
 _separator_registry_lock = threading.Lock()
 
-def init_demucs():
-    load_model()
+
+def init_demucs(model_name: str = "htdemucs_ft", device: str = "auto", shifts: int = 5):
+    return load_model(model_name=model_name, device=device, shifts=shifts)
 
 
-def _resolve_device(device: str):
-    resolved = resolve_torch_device(device)
-    if isinstance(resolved, str):
-        return resolved
-    return str(resolved)
-    
-def load_model(model_name: str = "htdemucs_ft", device: str = 'auto', progress: bool = True, shifts: int=5) -> Separator:
+def _resolve_device(device: str) -> str:
+    return str(resolve_torch_device(device))
+
+
+def load_model(
+    model_name: str = "htdemucs_ft",
+    device: str = 'auto',
+    progress: bool = True,
+    shifts: int = 5,
+) -> Separator:
     resolved_device = _resolve_device(device)
+    cache_key = (model_name, resolved_device, int(shifts))
     with _separator_registry_lock:
-        existing = _separators.get(resolved_device)
+        existing = _separators.get(cache_key)
         if existing is not None:
             logger.info(f'Demucs model already loaded on {resolved_device}')
             return existing
         _separator_locks.setdefault(resolved_device, threading.Lock())
 
-    logger.info(f'Loading Demucs model: {model_name}')
+    logger.info(f'Loading Demucs model: {model_name} on {resolved_device}')
     t_start = time.time()
     separator = Separator(model_name, device=resolved_device, progress=progress, shifts=shifts)
     t_end = time.time()
     logger.info(f'Demucs model loaded on {resolved_device} in {t_end - t_start:.2f} seconds')
     with _separator_registry_lock:
-        _separators[resolved_device] = separator
+        existing = _separators.get(cache_key)
+        if existing is not None:
+            return existing
+        _separators[cache_key] = separator
     return separator
 
-def separate_audio(folder: str, model_name: str = "htdemucs_ft", device: str = 'auto', progress: bool = True, shifts: int = 5) -> None:
+
+def separate_audio(
+    folder: str,
+    model_name: str = "htdemucs_ft",
+    device: str = 'auto',
+    progress: bool = True,
+    shifts: int = 5,
+) -> None:
     audio_path = os.path.join(folder, 'audio.wav')
     if not os.path.exists(audio_path):
-        return
+        raise FileNotFoundError(f'Input audio not found for vocal separation: {audio_path}')
+
     vocal_output_path = os.path.join(folder, 'audio_vocals.wav')
     instruments_output_path = os.path.join(folder, 'audio_instruments.wav')
-    
-    if os.path.exists(vocal_output_path) and os.path.exists(instruments_output_path):
+
+    if _has_valid_audio_content(vocal_output_path) and _has_valid_audio_content(instruments_output_path):
         logger.info(f'Audio already separated in {folder}')
         return
-    
+
     # Demucs cannot process empty wav; fail fast with a clear error.
     if not _has_valid_audio_content(audio_path):
-        raise Exception(f'Invalid/empty audio extracted from {folder}: {audio_path}')
+        raise RuntimeError(f'Invalid/empty audio extracted from {folder}: {audio_path}')
 
     logger.info(f'Separating audio from {folder}')
     sep = load_model(model_name, device, progress, shifts)
@@ -76,14 +94,12 @@ def separate_audio(folder: str, model_name: str = "htdemucs_ft", device: str = '
                     logger.warning('Demucs CPU fallback succeeded.')
                 except Exception as cpu_e:
                     logger.exception(f'Demucs CPU fallback failed on {folder}: {cpu_e}')
-                    time.sleep(1)
-                    raise Exception(f'Error separating audio from {folder}')
+                    raise RuntimeError(f'Error separating audio from {folder}') from cpu_e
             else:
-                time.sleep(1)
-                raise Exception(f'Error separating audio from {folder}')
+                raise RuntimeError(f'Error separating audio from {folder}') from e
     t_end = time.time()
     logger.info(f'Audio separated in {t_end - t_start:.2f} seconds')
-    
+
     vocals = separated['vocals'].numpy().T
     instruments = None
     for k, v in separated.items():
@@ -92,22 +108,20 @@ def separate_audio(folder: str, model_name: str = "htdemucs_ft", device: str = '
         if instruments is None:
             instruments = v
         else:
-            instruments += v
+            instruments = instruments + v
     instruments = instruments.numpy().T
-    
-    vocal_output_path = os.path.join(folder, 'audio_vocals.wav')
-    instruments_output_path = os.path.join(folder, 'audio_instruments.wav')
-    
+
     save_wav(vocals, vocal_output_path, sample_rate=44100)
     logger.info(f'Vocals saved to {vocal_output_path}')
-    
+
     save_wav(instruments, instruments_output_path, sample_rate=44100)
     logger.info(f'Instruments saved to {instruments_output_path}')
-    
+
+
 def extract_audio_from_video(folder: str) -> bool:
     video_path = os.path.join(folder, 'download.mp4')
     if not os.path.exists(video_path):
-        return False
+        raise FileNotFoundError(f'Input video not found: {video_path}')
     audio_path = os.path.join(folder, 'audio.wav')
     if os.path.exists(audio_path):
         if _has_valid_audio_content(audio_path):
@@ -125,15 +139,14 @@ def extract_audio_from_video(folder: str) -> bool:
         '-ar', '44100',
         '-ac', '2',
         audio_path,
-        '-y'
+        '-y',
     ]
     subprocess.run(ffmpeg_command, check=True)
     if not _has_valid_audio_content(audio_path):
-        raise Exception(
+        raise RuntimeError(
             f'Extracted audio is empty for {folder}. '
             f'This video may have no audio track or a broken audio stream.'
         )
-    time.sleep(1)
     logger.info(f'Audio extracted from {folder}')
     return True
 
@@ -146,4 +159,3 @@ def _has_valid_audio_content(audio_path: str) -> bool:
             return wf.getnframes() > 0
     except Exception:
         return False
-    

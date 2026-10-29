@@ -1,16 +1,20 @@
-import json
-import time
+from contextlib import contextmanager
 import importlib
-import librosa
-import numpy as np
-import whisperx
+import json
 import os
+import pickle
 import threading
-from loguru import logger
-import torch
-from dotenv import load_dotenv
+import time
 
-from .utils import save_wav, resolve_torch_device
+from dotenv import load_dotenv
+import librosa
+from loguru import logger
+import numpy as np
+import torch
+import whisperx
+
+from .utils import resolve_torch_device, save_wav
+
 load_dotenv()
 
 _whisper_models = {}
@@ -18,7 +22,28 @@ _align_models = {}
 _diarize_models = {}
 _registry_lock = threading.RLock()
 _infer_locks = {}
+_align_locks = {}
+_diarize_locks = {}
+_torch_load_lock = threading.Lock()
 _ALIGN_FALLBACK_LANGUAGE = os.getenv('WHISPERX_ALIGN_FALLBACK_LANGUAGE', 'en')
+
+
+@contextmanager
+def _pyannote_torch_load_compat():
+    """Scoped fallback for pyannote/lightning checkpoints on PyTorch >= 2.6.
+    Uses setdefault so explicit weights_only=True calls remain intact."""
+    with _torch_load_lock:
+        original_torch_load = torch.load
+
+        def _patched_torch_load(*args, **kwargs):
+            kwargs.setdefault('weights_only', False)
+            return original_torch_load(*args, **kwargs)
+
+        torch.load = _patched_torch_load
+        try:
+            yield
+        finally:
+            torch.load = original_torch_load
 
 
 def _get_registry_lock():
@@ -49,22 +74,25 @@ def _get_diarization_model_name():
     return os.getenv('WHISPERX_DIARIZATION_MODEL')
 
 
-def _normalize_whisperx_device(device):
-    if isinstance(device, str) and device.startswith('cuda:'):
-        # whisperx/faster-whisper expects "cuda" rather than "cuda:{idx}".
-        # Keep GPU selection by setting current CUDA device explicitly.
-        try:
-            torch.cuda.set_device(int(device.split(':', 1)[1]))
-        except Exception:
-            pass
-        return 'cuda'
-    return device
-
-
-def _resolve_whisperx_device(device: str):
+def _resolve_whisperx_device(device: str) -> tuple[str, int, str]:
+    """
+    Resolve device into:
+      - api_device: 'cuda' or 'cpu' (for faster-whisper / ctranslate2)
+      - device_index: GPU integer index (for faster-whisper multi-GPU selection)
+      - device_key: exact torch device string e.g. 'cuda:1' or 'cpu'
+        (for PyTorch alignment & diarization models, avoiding process-global
+        torch.cuda.set_device races across threads).
+    """
     resolved = str(resolve_torch_device(device))
-    api_device = _normalize_whisperx_device(resolved)
-    return api_device, resolved
+    if resolved.startswith('cuda:'):
+        try:
+            idx = int(resolved.split(':', 1)[1])
+        except ValueError:
+            idx = 0
+        return 'cuda', idx, f'cuda:{idx}'
+    if resolved == 'cuda':
+        return 'cuda', 0, 'cuda:0'
+    return resolved, 0, resolved
 
 
 def _normalize_source_language(source_language):
@@ -84,15 +112,21 @@ def _normalize_source_language(source_language):
     return aliases.get(src, src)
 
 
-def init_whisperx():
-    load_whisper_model()
-    load_align_model()
-    load_diarize_model()
-    
-def load_whisper_model(model_name: str = 'large-v3', download_root = 'models/ASR/whisper', device='auto'):
+def init_whisperx(
+    model_name: str = 'large-v3',
+    download_root: str = 'models/ASR/whisper',
+    device: str = 'auto',
+    diarization: bool = True,
+):
+    load_whisper_model(model_name=model_name, download_root=download_root, device=device)
+    if diarization:
+        load_diarize_model(device=device)
+
+
+def load_whisper_model(model_name: str = 'large-v3', download_root='models/ASR/whisper', device='auto'):
     if model_name == 'large':
         model_name = 'large-v3'
-    api_device, device_key = _resolve_whisperx_device(device)
+    api_device, device_index, device_key = _resolve_whisperx_device(device)
     key = (model_name, device_key)
     lock = _get_registry_lock()
     with lock:
@@ -101,16 +135,27 @@ def load_whisper_model(model_name: str = 'large-v3', download_root = 'models/ASR
             return model
     logger.info(f'Loading WhisperX model: {model_name} on {device_key}')
     t_start = time.time()
-    model = whisperx.load_model(model_name, download_root=download_root, device=api_device)
+    load_kwargs = {'download_root': download_root, 'device': api_device}
+    if api_device == 'cuda':
+        load_kwargs['device_index'] = device_index
+    try:
+        model = whisperx.load_model(model_name, **load_kwargs)
+    except TypeError:
+        load_kwargs.pop('device_index', None)
+        model = whisperx.load_model(model_name, **load_kwargs)
     t_end = time.time()
     logger.info(f'Loaded WhisperX model: {model_name} on {device_key} in {t_end - t_start:.2f}s')
     with lock:
+        existing = _whisper_models.get(key)
+        if existing is not None:
+            return existing
         _whisper_models[key] = model
         _infer_locks.setdefault(key, threading.Lock())
     return model
 
+
 def load_align_model(language='en', device='auto'):
-    api_device, device_key = _resolve_whisperx_device(device)
+    _, _, device_key = _resolve_whisperx_device(device)
     key = (language, device_key)
     lock = _get_registry_lock()
     with lock:
@@ -118,14 +163,33 @@ def load_align_model(language='en', device='auto'):
         if cached is not None:
             return cached
     t_start = time.time()
-    align_model, align_metadata = whisperx.load_align_model(
-        language_code=language, device=api_device)
+    try:
+        align_model, align_metadata = whisperx.load_align_model(
+            language_code=language, device=device_key
+        )
+    except pickle.UnpicklingError:
+        with _pyannote_torch_load_compat():
+            align_model, align_metadata = whisperx.load_align_model(
+                language_code=language, device=device_key
+            )
     t_end = time.time()
     logger.info(f'Loaded alignment model: {language} on {device_key} in {t_end - t_start:.2f}s')
     with lock:
+        existing = _align_models.get(key)
+        if existing is not None:
+            return existing
         _align_models[key] = (align_model, align_metadata)
+        _align_locks.setdefault(key, threading.Lock())
     return align_model, align_metadata
-    
+
+
+def _instantiate_diarize_pipeline(diarization_pipeline_cls, hf_token: str, init_kwargs: dict):
+    try:
+        return diarization_pipeline_cls(token=hf_token, **init_kwargs)
+    except TypeError:
+        return diarization_pipeline_cls(use_auth_token=hf_token, **init_kwargs)
+
+
 def load_diarize_model(device='auto'):
     if not _supports_diarization_pipeline():
         logger.warning('Current whisperx version does not support DiarizationPipeline, diarization disabled.')
@@ -138,7 +202,7 @@ def load_diarize_model(device='auto'):
     if diarization_pipeline_cls is None:
         logger.warning('Cannot import whisperx diarization pipeline, diarization disabled.')
         return None
-    api_device, device_key = _resolve_whisperx_device(device)
+    _, _, device_key = _resolve_whisperx_device(device)
     key = device_key
     lock = _get_registry_lock()
     with lock:
@@ -147,14 +211,16 @@ def load_diarize_model(device='auto'):
             return existing
     t_start = time.time()
     model_name = _get_diarization_model_name()
-    init_kwargs = {'device': api_device}
+    init_kwargs = {'device': device_key}
     if model_name:
         init_kwargs['model_name'] = model_name
     try:
-        # Prefer new signature (token=...), and fallback to legacy signature.
-        diarize_model = diarization_pipeline_cls(token=hf_token, **init_kwargs)
-    except TypeError:
-        diarize_model = diarization_pipeline_cls(use_auth_token=hf_token, **init_kwargs)
+        try:
+            diarize_model = _instantiate_diarize_pipeline(diarization_pipeline_cls, hf_token, init_kwargs)
+        except pickle.UnpicklingError:
+            logger.info('Retrying pyannote diarization load with PyTorch 2.6+ compatibility mode...')
+            with _pyannote_torch_load_compat():
+                diarize_model = _instantiate_diarize_pipeline(diarization_pipeline_cls, hf_token, init_kwargs)
     except Exception as e:
         logger.exception(
             f'Failed to load diarization model: {e}. '
@@ -164,7 +230,11 @@ def load_diarize_model(device='auto'):
     t_end = time.time()
     logger.info(f'Loaded diarization model on {device_key} in {t_end - t_start:.2f}s')
     with lock:
+        existing = _diarize_models.get(key)
+        if existing is not None:
+            return existing
         _diarize_models[key] = diarize_model
+        _diarize_locks.setdefault(key, threading.Lock())
     return diarize_model
 
 
@@ -185,9 +255,9 @@ def merge_segments(transcript, max_gap=0.5):
         gap = max(0.0, float(segment['start']) - float(current['end']))
         same_speaker = current.get('speaker') == segment.get('speaker')
         should_merge = (
-            gap < max_gap and
-            not _ends_with_terminal_punctuation(current.get('text', '')) and
-            same_speaker
+            gap < max_gap
+            and not _ends_with_terminal_punctuation(current.get('text', ''))
+            and same_speaker
         )
         if should_merge:
             spacer = '' if current.get('text', '').endswith(' ') else ' '
@@ -196,6 +266,7 @@ def merge_segments(transcript, max_gap=0.5):
         else:
             merged_transcription.append(dict(segment))
     return merged_transcription
+
 
 def transcribe_audio(
     folder,
@@ -208,18 +279,20 @@ def transcribe_audio(
     max_speakers=None,
     source_language='auto',
 ):
-    if os.path.exists(os.path.join(folder, 'transcript.json')):
+    transcript_path = os.path.join(folder, 'transcript.json')
+    if os.path.isfile(transcript_path) and os.path.getsize(transcript_path) > 0:
         logger.info(f'Transcript already exists in {folder}')
         return True
-    
+
     wav_path = os.path.join(folder, 'audio_vocals.wav')
     if not os.path.exists(wav_path):
-        return False
-    
+        raise FileNotFoundError(f'Vocals wav not found for transcription: {wav_path}')
+
     logger.info(f'Transcribing {wav_path}')
-    active_device, active_device_key = _resolve_whisperx_device(device)
-    model = load_whisper_model(model_name, download_root, active_device_key)
-    model_key = ('large-v3' if model_name == 'large' else model_name, active_device_key)
+    active_api_device, _, active_device_key = _resolve_whisperx_device(device)
+    normalized_model_name = 'large-v3' if model_name == 'large' else model_name
+    model = load_whisper_model(normalized_model_name, download_root, active_device_key)
+    model_key = (normalized_model_name, active_device_key)
     infer_lock = _infer_locks.setdefault(model_key, threading.Lock())
     batch_try = max(1, int(batch_size))
     forced_language = _normalize_source_language(source_language)
@@ -233,30 +306,31 @@ def transcribe_audio(
                 rec_result = model.transcribe(wav_path, **kwargs)
         except Exception as e:
             error_message = str(e).lower()
-            too_large = ('out of memory' in error_message) or ('batch_size' in error_message and 'too large' in error_message)
-            if too_large and str(active_device).startswith('cuda') and batch_try > 1:
+            too_large = ('out of memory' in error_message) or (
+                'batch_size' in error_message and 'too large' in error_message
+            )
+            if too_large and str(active_api_device).startswith('cuda') and batch_try > 1:
                 next_batch = max(1, batch_try // 2)
                 logger.warning(f'WhisperX CUDA batch too large ({batch_try}), retry with batch_size={next_batch}')
                 batch_try = next_batch
                 torch.cuda.empty_cache()
                 continue
-            if too_large and str(active_device).startswith('cuda'):
+            if too_large and str(active_api_device).startswith('cuda'):
                 logger.warning('WhisperX CUDA still OOM/batch-too-large, fallback to CPU...')
-                active_device = 'cpu'
+                active_api_device = 'cpu'
                 active_device_key = 'cpu'
-                model = load_whisper_model(model_name, download_root, active_device_key)
-                model_key = ('large-v3' if model_name == 'large' else model_name, active_device_key)
+                model = load_whisper_model(normalized_model_name, download_root, active_device_key)
+                model_key = (normalized_model_name, active_device_key)
                 infer_lock = _infer_locks.setdefault(model_key, threading.Lock())
                 batch_try = min(4, max(1, batch_try))
                 continue
             raise
     if rec_result is None:
         raise RuntimeError('WhisperX transcription failed after batch-size fallback and CPU retry.')
-    
-    if rec_result['language'] == 'nn':
-        logger.warning(f'No language detected in {wav_path}')
-        return False
-    
+
+    if rec_result.get('language') == 'nn':
+        raise RuntimeError(f'No recognizable spoken language detected in {wav_path}')
+
     detected_language = str(rec_result.get('language', '')).strip().lower()
     align_language = forced_language or detected_language
     try:
@@ -272,45 +346,81 @@ def transcribe_audio(
             rec_result = model.transcribe(wav_path, batch_size=batch_try, language=fallback_lang)
         align_language = fallback_lang
         align_model, align_metadata = load_align_model(align_language, active_device_key)
-    rec_result = whisperx.align(rec_result['segments'], align_model, align_metadata,
-                                wav_path, active_device, return_char_alignments=False)
-    
+
+    align_lock = _align_locks.setdefault((align_language, active_device_key), threading.Lock())
+    with align_lock:
+        rec_result = whisperx.align(
+            rec_result['segments'],
+            align_model,
+            align_metadata,
+            wav_path,
+            active_device_key,
+            return_char_alignments=False,
+        )
+
     if diarization:
         diarize_model = load_diarize_model(active_device_key)
         if diarize_model is not None:
-            diarize_segments = diarize_model(wav_path,min_speakers=min_speakers, max_speakers=max_speakers)
+            diarize_lock = _diarize_locks.setdefault(active_device_key, threading.Lock())
+            with diarize_lock:
+                diarize_segments = diarize_model(
+                    wav_path, min_speakers=min_speakers, max_speakers=max_speakers
+                )
             rec_result = whisperx.assign_word_speakers(diarize_segments, rec_result)
         else:
             logger.warning('Diarization requested but unavailable, continue without speaker diarization.')
-        
-    transcript = [{'start': segement['start'], 'end': segement['end'], 'text': segement['text'].strip(), 'speaker': segement.get('speaker', 'SPEAKER_00')} for segement in rec_result['segments']]
+
+    transcript = [
+        {
+            'start': segment['start'],
+            'end': segment['end'],
+            'text': segment['text'].strip(),
+            'speaker': segment.get('speaker', 'SPEAKER_00'),
+        }
+        for segment in rec_result['segments']
+        if segment.get('text', '').strip()
+    ]
     transcript = merge_segments(transcript)
-    with open(os.path.join(folder, 'transcript.json'), 'w', encoding='utf-8') as f:
+    with open(transcript_path, 'w', encoding='utf-8') as f:
         json.dump(transcript, f, indent=4, ensure_ascii=False)
-    logger.info(f'Transcribed {wav_path} successfully, and saved to {os.path.join(folder, "transcript.json")}')
+    logger.info(f'Transcribed {wav_path} successfully, and saved to {transcript_path}')
     generate_speaker_audio(folder, transcript)
     return True
+
 
 def generate_speaker_audio(folder, transcript):
     wav_path = os.path.join(folder, 'audio_vocals.wav')
     audio_data, samplerate = librosa.load(wav_path, sr=24000)
-    speaker_dict = dict()
+    speaker_dict = {}
+    speaker_prompts = {}
+    max_prompt_samples = int(29.0 * samplerate)
     length = len(audio_data)
     delay = 0.05
+
     for segment in transcript:
+        speaker = segment['speaker']
         start = max(0, int((segment['start'] - delay) * samplerate))
-        end = min(int((segment['end']+delay) * samplerate), length)
+        end = min(int((segment['end'] + delay) * samplerate), length)
         speaker_segment_audio = audio_data[start:end]
-        speaker_dict[segment['speaker']] = np.concatenate((speaker_dict.get(
-            segment['speaker'], np.zeros((0, ))), speaker_segment_audio))
+        prev_audio = speaker_dict.get(speaker, np.zeros((0,)))
+
+        # Record verbatim transcript matching the <=29s reference prefix of SPEAKER/{speaker}.wav
+        # so same-language zero-shot TTS has an exact audio-text pair.
+        if len(prev_audio) + len(speaker_segment_audio) <= max_prompt_samples:
+            seg_text = (segment.get('text') or '').strip()
+            if seg_text:
+                speaker_prompts.setdefault(speaker, []).append(seg_text)
+
+        speaker_dict[speaker] = np.concatenate((prev_audio, speaker_segment_audio))
 
     speaker_folder = os.path.join(folder, 'SPEAKER')
-    if not os.path.exists(speaker_folder):
-        os.makedirs(speaker_folder)
-    
-    for speaker, audio in speaker_dict.items():
-        speaker_file_path = os.path.join(
-            speaker_folder, f"{speaker}.wav")
-        save_wav(audio, speaker_file_path)
-            
+    os.makedirs(speaker_folder, exist_ok=True)
 
+    for speaker, audio in speaker_dict.items():
+        speaker_file_path = os.path.join(speaker_folder, f'{speaker}.wav')
+        save_wav(audio, speaker_file_path)
+        prompt_lines = speaker_prompts.get(speaker)
+        if prompt_lines:
+            prompt_txt_path = os.path.join(speaker_folder, f'{speaker}.txt')
+            with open(prompt_txt_path, 'w', encoding='utf-8') as f:
+                f.write(' '.join(prompt_lines))
