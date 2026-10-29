@@ -6,17 +6,18 @@ Exactly two public entry points:
     process_online_video(url, ...)
     process_local_video(file_path, ...)
 
-Each step is guarded by an explicit cache check: if the expected artefact
-already exists on disk the step is skipped, giving automatic resume capability.
+Each step is guarded by a parameter-aware fingerprint check: if the expected
+artefacts already exist on disk and match the current parameters, the step is
+skipped, giving automatic and deterministic resume capability.
 """
 
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
 import json
 import os
 import re
 import shutil
 import time
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
 from typing import Optional
 
 from loguru import logger
@@ -35,19 +36,16 @@ from .step010_demucs_vr import (
 from .step020_whisperx import (
     init_whisperx,
     transcribe_audio,
-    generate_speaker_audio,
 )
 from .step030_translation import translate
 from .step040_tts import generate_wavs
 from .step050_synthesize_video import synthesize_video
-from .step060_genrate_info import generate_info
-from .utils import pick_cuda_devices_for_workers
-
-try:
-    from .utils import compute_fingerprint, should_skip_step
-except ImportError:
-    compute_fingerprint = None
-    should_skip_step = None
+from .step060_generate_info import generate_info
+from .utils import (
+    mark_step_done,
+    reserved_cuda_devices,
+    should_skip_step,
+)
 
 
 # ── configuration ─────────────────────────────────────────────────────
@@ -136,88 +134,136 @@ def _prepare_local_video_folder(local_video_path: str, root_folder: str) -> str:
     return folder
 
 
-def _file_exists(path: str) -> bool:
-    """Check that a file exists AND is non-empty."""
-    return os.path.isfile(path) and os.path.getsize(path) > 0
-
-
-# ── cache / skip logic per step ───────────────────────────────────────
+# ── step specs (params + outputs) for deterministic caching ───────────
 def _cache_audio(folder: str) -> bool:
     audio_path = os.path.join(folder, "audio.wav")
     return os.path.isfile(audio_path) and os.path.getsize(audio_path) > 1024
 
 
-def _step_cached(folder: str, step_name: str, params: dict, output_paths: list[str]) -> bool:
-    """Wrapper that uses the parameter-aware ``should_skip_step`` when available,
-    falling back to plain file-existence checks otherwise."""
-    if should_skip_step is None:
-        return all(_file_exists(p) for p in output_paths)
-    return should_skip_step(folder, step_name, params, output_paths)
+def _vocals_spec(folder: str, cfg: PipelineConfig) -> tuple[str, dict, list[str]]:
+    return (
+        'step010_demucs',
+        {
+            'demucs_model': cfg.demucs_model,
+            'demucs_shifts': cfg.demucs_shifts,
+        },
+        [
+            os.path.join(folder, 'audio_vocals.wav'),
+            os.path.join(folder, 'audio_instruments.wav'),
+        ],
+    )
 
 
-def _cache_vocals(folder: str, cfg: PipelineConfig) -> bool:
-    return _step_cached(folder, 'step010_demucs', {
-        'demucs_model': cfg.demucs_model,
-        'demucs_shifts': cfg.demucs_shifts,
-        'device': str(cfg.demucs_device),
-    }, [
-        os.path.join(folder, 'audio_vocals.wav'),
-        os.path.join(folder, 'audio_instruments.wav'),
-    ])
+def _transcript_spec(folder: str, cfg: PipelineConfig) -> tuple[str, dict, list[str]]:
+    return (
+        'step020_whisperx',
+        {
+            'whisper_model': cfg.whisper_model,
+            'source_language': cfg.source_language,
+            'whisper_diarization': cfg.whisper_diarization,
+        },
+        [
+            os.path.join(folder, 'transcript.json'),
+        ],
+    )
 
 
-def _cache_transcript(folder: str, cfg: PipelineConfig) -> bool:
-    return _step_cached(folder, 'step020_whisperx', {
-        'whisper_model': cfg.whisper_model,
-        'whisper_batch_size': cfg.whisper_batch_size,
-        'source_language': cfg.source_language,
-        'whisper_diarization': cfg.whisper_diarization,
-    }, [
-        os.path.join(folder, 'transcript.json'),
-    ])
+def _translation_spec(folder: str, cfg: PipelineConfig) -> tuple[str, dict, list[str]]:
+    return (
+        'step030_translation',
+        {
+            'translation_target_language': cfg.translation_target_language,
+            'model_name': os.getenv('MODEL_NAME', 'gpt-3.5-turbo'),
+            'tbatch': os.getenv('TRANSLATION_BATCH_SIZE', '10'),
+        },
+        [
+            os.path.join(folder, 'translation.json'),
+        ],
+    )
 
 
-def _cache_translation(folder: str, cfg: PipelineConfig) -> bool:
-    return _step_cached(folder, 'step030_translation', {
-        'translation_target_language': cfg.translation_target_language,
-        'model_name': os.getenv('MODEL_NAME', 'gpt-3.5-turbo'),
-        'tbatch': os.getenv('TRANSLATION_BATCH_SIZE', '10'),
-    }, [
-        os.path.join(folder, 'translation.json'),
-    ])
+def _tts_spec(folder: str, cfg: PipelineConfig) -> tuple[str, dict, list[str], list[str]]:
+    return (
+        'step040_tts',
+        {
+            'tts_engine': cfg.tts_engine,
+            'target_language': cfg.translation_target_language,
+            'formation_tts_style': os.getenv('FORMATION_TTS_STYLE', 'chinese_compact'),
+        },
+        [
+            os.path.join(folder, 'audio_combined.wav'),
+            os.path.join(folder, 'translation_tts.json'),
+        ],
+        [
+            os.path.join(folder, 'wavs'),
+            os.path.join(folder, 'audio_tts.wav'),
+        ],
+    )
 
 
-def _cache_tts(folder: str, cfg: PipelineConfig) -> bool:
-    return _step_cached(folder, 'step040_tts', {
-        'tts_engine': cfg.tts_engine,
-        'formation_tts_style': os.getenv('FORMATION_TTS_STYLE', 'chinese_compact'),
-        'tts_device': str(cfg.tts_device),
-    }, [
-        os.path.join(folder, 'audio_combined.wav'),
-    ])
+def _video_spec(folder: str, cfg: PipelineConfig) -> tuple[str, dict, list[str]]:
+    return (
+        'step050_synthesize_video',
+        {
+            'tts_engine': cfg.tts_engine,
+            'target_language': cfg.translation_target_language,
+            'subtitles': cfg.subtitles,
+            'speed_up': cfg.speed_up,
+            'fps': cfg.fps,
+            'target_resolution': cfg.target_resolution,
+        },
+        [
+            os.path.join(folder, 'video.mp4'),
+        ],
+    )
 
 
-def _cache_video(folder: str, cfg: PipelineConfig) -> bool:
-    return _step_cached(folder, 'step050_synthesize_video', {
-        'subtitles': cfg.subtitles,
-        'speed_up': cfg.speed_up,
-        'fps': cfg.fps,
-        'target_resolution': cfg.target_resolution,
-    }, [
-        os.path.join(folder, 'video.mp4'),
-    ])
+def _info_spec(folder: str, cfg: PipelineConfig) -> tuple[str, dict, list[str]]:
+    return (
+        'step060_generate_info',
+        {
+            'target_language': cfg.translation_target_language,
+        },
+        [
+            os.path.join(folder, 'video.txt'),
+        ],
+    )
 
 
 # ── model warm-up ─────────────────────────────────────────────────────
-def _warm_up_models() -> None:
-    """Pre-load heavy models in parallel; fail fast on any error."""
-    from .step042_tts_xtts import init_TTS  # noqa: avoid top-level heavy import
+def _warm_up_models(cfg: PipelineConfig, devices: list[str]) -> None:
+    """Pre-load only the active models on the primary assigned device; fail fast on config errors."""
+    primary_device = devices[0] if devices else 'auto'
 
-    with ThreadPoolExecutor() as pool:
+    def _warmup_tts():
+        if cfg.tts_engine == 'cosyvoice':
+            from .step043_tts_cosyvoice import load_cosyvoice_model
+            return load_cosyvoice_model(device=primary_device)
+        from .step042_tts_xtts import init_TTS
+        loaded = init_TTS(device=primary_device)
+        if loaded is None:
+            raise RuntimeError(
+                'XTTS v2 weights are not configured (OMNIDUB_XTTS_LOCAL_PATH is unset). '
+                'Configure local XTTS weights or switch tts_engine to "cosyvoice".'
+            )
+        return loaded
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
         futures = {
-            "demucs": pool.submit(init_demucs),
-            "tts": pool.submit(init_TTS),
-            "whisperx": pool.submit(init_whisperx),
+            "demucs": pool.submit(
+                init_demucs,
+                model_name=cfg.demucs_model,
+                device=primary_device,
+                shifts=cfg.demucs_shifts,
+            ),
+            "tts": pool.submit(_warmup_tts),
+            "whisperx": pool.submit(
+                init_whisperx,
+                model_name=cfg.whisper_model,
+                download_root=cfg.whisper_download_root,
+                device=primary_device,
+                diarization=cfg.whisper_diarization,
+            ),
         }
         for name, fut in futures.items():
             try:
@@ -244,7 +290,8 @@ def _run_pipeline(folder: str, cfg: PipelineConfig) -> None:
     logger.info(f"[Pipeline] START  folder={folder}")
 
     # ── Step 1: extract audio + vocal separation ──────────────────────
-    if not _cache_vocals(folder, cfg):
+    s1_name, s1_params, s1_outputs = _vocals_spec(folder, cfg)
+    if not should_skip_step(folder, s1_name, s1_params, s1_outputs):
         if not _cache_audio(folder):
             logger.info("[Step 1] Extracting audio from video ...")
             extract_audio_from_video(folder)
@@ -256,11 +303,16 @@ def _run_pipeline(folder: str, cfg: PipelineConfig) -> None:
             progress=True,
             shifts=cfg.demucs_shifts,
         )
+        mark_step_done(folder, s1_name, s1_params, s1_outputs)
     else:
         logger.info("[Step 1] SKIP — vocals already separated")
 
     # ── Step 2: speech recognition ────────────────────────────────────
-    if not _cache_transcript(folder, cfg):
+    s2_name, s2_params, s2_outputs = _transcript_spec(folder, cfg)
+    if not should_skip_step(
+        folder, s2_name, s2_params, s2_outputs,
+        extra_cleanup_paths=[os.path.join(folder, 'SPEAKER')],
+    ):
         logger.info("[Step 2] Transcribing speech ...")
         transcribe_audio(
             folder,
@@ -273,25 +325,42 @@ def _run_pipeline(folder: str, cfg: PipelineConfig) -> None:
             max_speakers=cfg.whisper_max_speakers,
             source_language=cfg.source_language,
         )
+        mark_step_done(folder, s2_name, s2_params, s2_outputs)
     else:
         logger.info("[Step 2] SKIP — transcript already exists")
 
     # ── Step 3: translation ───────────────────────────────────────────
-    if not _cache_translation(folder, cfg):
+    s3_name, s3_params, s3_outputs = _translation_spec(folder, cfg)
+    if not should_skip_step(
+        folder, s3_name, s3_params, s3_outputs,
+        extra_cleanup_paths=[os.path.join(folder, 'summary.json')],
+    ):
         logger.info("[Step 3] Translating subtitles ...")
         translate(folder, target_language=cfg.translation_target_language)
+        mark_step_done(folder, s3_name, s3_params, s3_outputs)
     else:
         logger.info("[Step 3] SKIP — translation already cached")
 
     # ── Step 4: TTS ───────────────────────────────────────────────────
-    if not _cache_tts(folder, cfg):
+    s4_name, s4_params, s4_outputs, s4_extra = _tts_spec(folder, cfg)
+    if not should_skip_step(folder, s4_name, s4_params, s4_outputs, extra_cleanup_paths=s4_extra):
         logger.info("[Step 4] Generating TTS audio ...")
-        generate_wavs(folder, tts_engine=cfg.tts_engine, tts_device=cfg.tts_device)
+        generate_wavs(
+            folder,
+            tts_engine=cfg.tts_engine,
+            tts_device=cfg.tts_device,
+            target_language=cfg.translation_target_language,
+        )
+        mark_step_done(folder, s4_name, s4_params, s4_outputs)
     else:
         logger.info("[Step 4] SKIP — TTS audio already generated")
 
     # ── Step 5: video compositing ─────────────────────────────────────
-    if not _cache_video(folder, cfg):
+    s5_name, s5_params, s5_outputs = _video_spec(folder, cfg)
+    if not should_skip_step(
+        folder, s5_name, s5_params, s5_outputs,
+        extra_cleanup_paths=[os.path.join(folder, 'subtitles.srt')],
+    ):
         logger.info("[Step 5] Compositing final video ...")
         synthesize_video(
             folder,
@@ -300,12 +369,18 @@ def _run_pipeline(folder: str, cfg: PipelineConfig) -> None:
             fps=cfg.fps,
             resolution=cfg.target_resolution,
         )
+        mark_step_done(folder, s5_name, s5_params, s5_outputs)
     else:
         logger.info("[Step 5] SKIP — final video already exists")
 
     # ── Step 6: info / thumbnail ──────────────────────────────────────
-    logger.info("[Step 6] Generating info / thumbnail ...")
-    generate_info(folder)
+    s6_name, s6_params, s6_outputs = _info_spec(folder, cfg)
+    if not should_skip_step(folder, s6_name, s6_params, s6_outputs):
+        logger.info("[Step 6] Generating info / thumbnail ...")
+        generate_info(folder)
+        mark_step_done(folder, s6_name, s6_params, s6_outputs)
+    else:
+        logger.info("[Step 6] SKIP — info already generated")
 
     logger.info(f"[Pipeline] DONE   folder={folder}")
 
@@ -351,6 +426,21 @@ def _parse_multi_input(raw: str):
     ]
 
 
+def _validate_xtts_license(tts_engine: str, xtts_cpml_ack: bool) -> None:
+    if tts_engine == 'xtts' and not xtts_cpml_ack:
+        logger.error('XTTS v2 requires CPML non-commercial acknowledgment. Aborting.')
+        raise ValueError(
+            'XTTS v2 requires explicit CPML acknowledgment. '
+            'Set xtts_cpml_ack=True or switch tts_engine to "cosyvoice". '
+            'See https://coqui.ai/cpml'
+        )
+    if tts_engine == 'xtts':
+        logger.warning(
+            'XTTS v2 is licensed under CPML — non-commercial use only. '
+            'See https://coqui.ai/cpml'
+        )
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  PUBLIC API — two entry points only
 # ══════════════════════════════════════════════════════════════════════
@@ -379,8 +469,6 @@ def process_online_video(
         Defence-in-depth CPML acknowledgment. The Gradio UI also enforces this
         gate; passing True here is required to use ``tts_engine='xtts'`` from
         any caller (CLI, script, notebook).
-    **overrides
-        Any field of ``PipelineConfig`` to override the defaults.
 
     Returns
     -------
@@ -398,18 +486,7 @@ def process_online_video(
         max_workers=max(1, int(max_workers)),
     )
 
-    if cfg.tts_engine == 'xtts' and not xtts_cpml_ack:
-        logger.error('XTTS v2 requires CPML non-commercial acknowledgment. Aborting.')
-        raise ValueError(
-            'XTTS v2 requires explicit CPML acknowledgment. '
-            'Set xtts_cpml_ack=True or switch tts_engine to "cosyvoice". '
-            'See https://coqui.ai/cpml'
-        )
-    if cfg.tts_engine == 'xtts':
-        logger.warning(
-            'XTTS v2 is licensed under CPML — non-commercial use only. '
-            'See https://coqui.ai/cpml'
-        )
+    _validate_xtts_license(cfg.tts_engine, xtts_cpml_ack)
 
     urls = _parse_multi_input(url)
     if not urls:
@@ -421,43 +498,49 @@ def process_online_video(
         return process_local_video(
             urls[0],
             root_folder=root_folder,
+            source_language=source_language,
             target_language=target_language,
             tts_engine=tts_engine,
             burn_subtitles=burn_subtitles,
             speed_up=speed_up,
+            max_workers=max_workers,
+            xtts_cpml_ack=xtts_cpml_ack,
         )
 
-    _warm_up_models()
-
-    info_list = list(get_info_list_from_url(urls, cfg.num_videos))
     ok, fail = 0, 0
-    if cfg.max_workers == 1:
-        worker_devices = pick_cuda_devices_for_workers(1)
-        logger.info(f"[Scheduler] Using device: {worker_devices[0]}")
-        single_cfg = _cfg_with_device(cfg, worker_devices[0])
-        for info in info_list:
-            if _process_online_info(info, single_cfg):
-                ok += 1
-            else:
-                fail += 1
-    else:
-        worker_devices = pick_cuda_devices_for_workers(cfg.max_workers)
-        logger.info(f"[Scheduler] Parallel devices: {worker_devices}")
-        logger.warning(f"Parallel mode enabled: max_workers={cfg.max_workers}")
-        with ThreadPoolExecutor(max_workers=cfg.max_workers) as pool:
-            futures = [
-                pool.submit(_process_online_info_on_device, info, cfg, worker_devices[i % len(worker_devices)])
-                for i, info in enumerate(info_list)
-            ]
-            for fut in futures:
-                try:
-                    if fut.result():
-                        ok += 1
-                    else:
-                        fail += 1
-                except Exception as exc:
-                    logger.error(f"Parallel worker crashed: {exc}")
+    with reserved_cuda_devices(cfg.max_workers) as worker_devices:
+        _warm_up_models(cfg, worker_devices)
+        info_list = list(get_info_list_from_url(urls, cfg.num_videos))
+        if cfg.max_workers == 1:
+            logger.info(f"[Scheduler] Using device: {worker_devices[0]}")
+            single_cfg = _cfg_with_device(cfg, worker_devices[0])
+            for info in info_list:
+                if _process_online_info(info, single_cfg):
+                    ok += 1
+                else:
                     fail += 1
+        else:
+            logger.info(f"[Scheduler] Parallel devices: {worker_devices}")
+            logger.warning(f"Parallel mode enabled: max_workers={cfg.max_workers}")
+            with ThreadPoolExecutor(max_workers=cfg.max_workers) as pool:
+                futures = [
+                    pool.submit(
+                        _process_online_info_on_device,
+                        info,
+                        cfg,
+                        worker_devices[i % len(worker_devices)],
+                    )
+                    for i, info in enumerate(info_list)
+                ]
+                for fut in futures:
+                    try:
+                        if fut.result():
+                            ok += 1
+                        else:
+                            fail += 1
+                    except Exception as exc:
+                        logger.error(f"Parallel worker crashed: {exc}")
+                        fail += 1
 
     return f"Success: {ok}  Fail: {fail}"
 
@@ -474,18 +557,14 @@ def process_local_video(
     xtts_cpml_ack: bool = False,
 ) -> str:
     """
-    Full pipeline for a local video file.
+    Full pipeline for one or more local video files.
 
     Parameters
     ----------
     file_path : str
-        Absolute or relative path to a local video file.
+        One or more local video paths separated by commas / newlines.
     xtts_cpml_ack : bool, default False
-        Defence-in-depth CPML acknowledgment. The Gradio UI also enforces this
-        gate; passing True here is required to use ``tts_engine='xtts'`` from
-        any caller (CLI, script, notebook).
-    **overrides
-        Any field of ``PipelineConfig`` to override the defaults.
+        Defence-in-depth CPML acknowledgment.
 
     Returns
     -------
@@ -501,29 +580,15 @@ def process_local_video(
         max_workers=max(1, int(max_workers)),
     )
 
-    if cfg.tts_engine == 'xtts' and not xtts_cpml_ack:
-        logger.error('XTTS v2 requires CPML non-commercial acknowledgment. Aborting.')
-        raise ValueError(
-            'XTTS v2 requires explicit CPML acknowledgment. '
-            'Set xtts_cpml_ack=True or switch tts_engine to "cosyvoice". '
-            'See https://coqui.ai/cpml'
-        )
-    if cfg.tts_engine == 'xtts':
-        logger.warning(
-            'XTTS v2 is licensed under CPML — non-commercial use only. '
-            'See https://coqui.ai/cpml'
-        )
-
-    _warm_up_models()
+    _validate_xtts_license(cfg.tts_engine, xtts_cpml_ack)
 
     file_paths = _parse_multi_input(file_path)
     if not file_paths:
         return "Error: no valid local video path provided."
 
-    def _process_single_local(path: str) -> tuple[bool, str]:
-        return _process_single_local_on_device(path, cfg, cfg.demucs_device)
-
-    def _process_single_local_on_device(path: str, base_cfg: PipelineConfig, device: str) -> tuple[bool, str]:
+    def _process_single_local_on_device(
+        path: str, base_cfg: PipelineConfig, device: str
+    ) -> tuple[bool, str]:
         try:
             folder = _prepare_local_video_folder(path, base_cfg.root_folder)
             local_cfg = _cfg_with_device(base_cfg, device)
@@ -535,36 +600,40 @@ def process_local_video(
 
     ok, fail = 0, 0
     folders = []
-    if cfg.max_workers == 1:
-        worker_devices = pick_cuda_devices_for_workers(1)
-        single_cfg = _cfg_with_device(cfg, worker_devices[0])
-        logger.info(f"[Scheduler] Using device: {worker_devices[0]}")
-        for path in file_paths:
-            success, folder = _process_single_local_on_device(path, single_cfg, worker_devices[0])
-            folders.append(folder)
-            if success:
-                ok += 1
-            else:
-                fail += 1
-    else:
-        worker_devices = pick_cuda_devices_for_workers(cfg.max_workers)
-        logger.info(f"[Scheduler] Parallel devices: {worker_devices}")
-        logger.warning(f"Parallel local mode enabled: max_workers={cfg.max_workers}")
-        with ThreadPoolExecutor(max_workers=cfg.max_workers) as pool:
-            futures = [
-                pool.submit(
-                    _process_single_local_on_device,
-                    path,
-                    cfg,
-                    worker_devices[i % len(worker_devices)],
-                )
-                for i, path in enumerate(file_paths)
-            ]
-            for fut in futures:
-                success, folder = fut.result()
+    with reserved_cuda_devices(cfg.max_workers) as worker_devices:
+        _warm_up_models(cfg, worker_devices)
+        if cfg.max_workers == 1:
+            logger.info(f"[Scheduler] Using device: {worker_devices[0]}")
+            for path in file_paths:
+                success, folder = _process_single_local_on_device(path, cfg, worker_devices[0])
                 folders.append(folder)
                 if success:
                     ok += 1
                 else:
                     fail += 1
+        else:
+            logger.info(f"[Scheduler] Parallel devices: {worker_devices}")
+            logger.warning(f"Parallel local mode enabled: max_workers={cfg.max_workers}")
+            with ThreadPoolExecutor(max_workers=cfg.max_workers) as pool:
+                futures = [
+                    pool.submit(
+                        _process_single_local_on_device,
+                        path,
+                        cfg,
+                        worker_devices[i % len(worker_devices)],
+                    )
+                    for i, path in enumerate(file_paths)
+                ]
+                for fut in futures:
+                    try:
+                        success, folder = fut.result()
+                        folders.append(folder)
+                        if success:
+                            ok += 1
+                        else:
+                            fail += 1
+                    except Exception as exc:
+                        logger.error(f"Parallel local worker crashed: {exc}")
+                        fail += 1
+
     return f"Success: {ok}  Fail: {fail}\nFolders: {folders}"
