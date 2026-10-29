@@ -1,12 +1,3 @@
-import torch
-# --- PyTorch 2.6+ compatibility patch ---
-_original_load = torch.load
-def _safe_load(*args, **kwargs):
-    kwargs['weights_only'] = False
-    return _original_load(*args, **kwargs)
-torch.load = _safe_load
-# --- end patch ---
-
 import inspect
 
 import gradio as gr
