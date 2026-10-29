@@ -106,7 +106,7 @@ OmniDub/
 │   ├── step042_tts_xtts.py         #   5a. XTTS v2 引擎
 │   ├── step043_tts_cosyvoice.py    #   5b. CosyVoice 引擎
 │   ├── step050_synthesize_video.py #   6. 视频合成
-│   └── step060_genrate_info.py     #   7. 缩略图+摘要
+│   └── step060_generate_info.py    #   7. 缩略图+摘要
 ├── CosyVoice/                      # CosyVoice TTS 引擎（内嵌源码）
 │   ├── cosyvoice/                  #   模型代码（仅保留运行时必需部分）
 │   ├── third_party/Matcha-TTS/     #   Matcha-TTS 依赖（见下方说明）
