@@ -1,15 +1,16 @@
-import os
-import re
-import importlib
-import pickle
-import threading
 from contextlib import contextmanager
-from TTS.api import TTS
+import importlib
+import os
+import pickle
+import re
+import threading
+import time
+
 from loguru import logger
 import numpy as np
 import torch
-import time
-from .utils import save_wav, resolve_torch_device
+
+from .utils import resolve_torch_device, save_wav
 
 # CPML 合规：
 # OmniDub 不主动从 HuggingFace / Coqui 自动下载 XTTS v2 权重（CPML 禁止再分发）。
@@ -18,9 +19,11 @@ from .utils import save_wav, resolve_torch_device
 #   2) 通过设置环境变量 OMNIDUB_XTTS_LOCAL_PATH=<本地权重目录>，
 #      或显式传入 model_path=<本地路径>。
 _XTTS_LOCAL_PATH_ENV = "OMNIDUB_XTTS_LOCAL_PATH"
+_SAFE_GLOBAL_PREFIXES = ("TTS.", "omegaconf.", "collections.", "builtins.")
 _models = {}
 _tts_locks = {}
 _models_lock = threading.Lock()
+_torch_load_lock = threading.Lock()
 _cpu_model = None
 _cpu_lock = threading.Lock()
 
@@ -28,48 +31,75 @@ _cpu_lock = threading.Lock()
 @contextmanager
 def _torch_load_weights_compat():
     """
-    Some TTS/XTTS checkpoints fail on torch>=2.6 default weights_only=True.
-    Temporarily force weights_only=False during model loading.
+    Fallback for legacy XTTS checkpoints that cannot be loaded with
+    weights_only=True even after allowlisting config classes.
+    Uses setdefault so explicit weights_only=True calls remain protected.
     """
-    original_torch_load = torch.load
+    with _torch_load_lock:
+        original_torch_load = torch.load
 
-    def _patched_torch_load(*args, **kwargs):
-        kwargs.setdefault("weights_only", False)
-        return original_torch_load(*args, **kwargs)
+        def _patched_torch_load(*args, **kwargs):
+            kwargs.setdefault("weights_only", False)
+            return original_torch_load(*args, **kwargs)
 
-    torch.load = _patched_torch_load
-    try:
-        yield
-    finally:
-        torch.load = original_torch_load
+        torch.load = _patched_torch_load
+        try:
+            yield
+        finally:
+            torch.load = original_torch_load
 
 
 def _allowlist_unsupported_global_from_error(error_message: str) -> bool:
     """
     PyTorch 2.6+ uses weights_only=True by default in torch.load.
-    Old XTTS checkpoints may reference config classes that need allowlisting.
+    Allowlist trusted XTTS/OmegaConf config globals on demand.
     """
+    if not hasattr(torch.serialization, "add_safe_globals"):
+        return False
     pattern = r"Unsupported global: GLOBAL ([A-Za-z0-9_\.]+)"
     match = re.search(pattern, error_message or "")
     if not match:
         return False
     full_name = match.group(1)
-    if "." not in full_name:
+    if "." not in full_name or not full_name.startswith(_SAFE_GLOBAL_PREFIXES):
+        logger.warning(f"Refusing to allowlist untrusted global: {full_name}")
         return False
     module_name, attr_name = full_name.rsplit(".", 1)
     try:
         module = importlib.import_module(module_name)
         attr = getattr(module, attr_name)
         torch.serialization.add_safe_globals([attr])
-        logger.warning(f"Allowlisted torch global for XTTS checkpoint: {full_name}")
+        logger.info(f"Allowlisted trusted torch global for XTTS checkpoint: {full_name}")
         return True
     except Exception as e:
         logger.warning(f"Failed to allowlist torch global: {full_name}, err={e}")
         return False
 
-def init_TTS():
-    load_model()
-    
+
+def _instantiate_xtts(model_path: str, device: str):
+    """Try safe weights_only=True with trusted global allowlisting first;
+    fall back to scoped setdefault(weights_only=False) only if needed."""
+    from TTS.api import TTS
+
+    max_attempts = 12
+    for _ in range(max_attempts):
+        try:
+            return TTS(model_path).to(device)
+        except pickle.UnpicklingError as e:
+            if not _allowlist_unsupported_global_from_error(str(e)):
+                logger.warning(
+                    "XTTS checkpoint requires legacy pickle deserialization; "
+                    "falling back to scoped weights_only=False load."
+                )
+                break
+    with _torch_load_weights_compat():
+        return TTS(model_path).to(device)
+
+
+def init_TTS(device='auto'):
+    return load_model(device=device)
+
+
 def load_model(model_path=None, device='auto'):
     device = str(resolve_torch_device(device))
     if model_path is None:
@@ -89,37 +119,16 @@ def load_model(model_path=None, device='auto'):
 
     logger.info(f'Loading TTS model from {model_path} on {device}')
     t_start = time.time()
-    last_error = None
-    allowlisted = []
-    max_attempts = 12
-    loaded = None
-    with _torch_load_weights_compat():
-        for _ in range(max_attempts):
-            try:
-                loaded = TTS(model_path).to(device)
-                break
-            except pickle.UnpicklingError as e:
-                last_error = e
-                # Auto-fix the common torch>=2.6 checkpoint allowlist issue.
-                if not _allowlist_unsupported_global_from_error(str(e)):
-                    raise
-                match = re.search(r"Unsupported global: GLOBAL ([A-Za-z0-9_\.]+)", str(e) or "")
-                if match:
-                    allowlisted.append(match.group(1))
-            except Exception as e:
-                last_error = e
-                raise
-    if loaded is None and last_error is not None:
-        raise RuntimeError(
-            f'Failed to load XTTS after {max_attempts} attempts. '
-            f'allowlisted={allowlisted}. last_error={last_error}'
-        )
+    loaded = _instantiate_xtts(model_path, device)
     with _models_lock:
+        existing = _models.get(device)
+        if existing is not None:
+            return existing
         _models[device] = loaded
     t_end = time.time()
     logger.info(f'TTS model loaded on {device} in {t_end - t_start:.2f}s')
     return loaded
-    
+
 
 def _is_cuda_runtime_error(error: Exception) -> bool:
     msg = str(error).lower()
@@ -144,14 +153,13 @@ def _get_cpu_model(model_name=None):
         )
     if _cpu_model is None:
         logger.warning('Initializing XTTS CPU fallback model...')
-        with _torch_load_weights_compat():
-            _cpu_model = TTS(model_name).to('cpu')
+        _cpu_model = _instantiate_xtts(model_name, 'cpu')
     return _cpu_model
 
 
-def tts(text, output_path, speaker_wav, model_name=None, device='auto', language='zh-cn'):
-    if os.path.exists(output_path):
-        logger.info(f'TTS output already exists: {text}')
+def tts(text, output_path, speaker_wav, model_name=None, device='auto', language='zh-cn', overwrite=False):
+    if not overwrite and os.path.isfile(output_path) and os.path.getsize(output_path) > 44:
+        logger.info(f'TTS output already exists: {output_path}')
         return
     if model_name is None:
         model_name = os.getenv(_XTTS_LOCAL_PATH_ENV)
@@ -171,7 +179,7 @@ def tts(text, output_path, speaker_wav, model_name=None, device='auto', language
     tts_lock = _tts_locks.setdefault(device, threading.Lock())
 
     last_error = None
-    for retry in range(3):
+    for _ in range(3):
         try:
             # XTTS model is shared across pipeline workers; inference must be serialized.
             with tts_lock:
@@ -182,13 +190,12 @@ def tts(text, output_path, speaker_wav, model_name=None, device='auto', language
             return
         except Exception as e:
             last_error = e
-            logger.warning(f'TTS failed: {text}')
-            logger.warning(e)
+            logger.warning(f'TTS failed: {text} ({e})')
             if _is_cuda_runtime_error(e):
                 logger.warning('XTTS CUDA runtime error detected, retrying on CPU fallback...')
                 try:
-                    cpu_model = _get_cpu_model(model_name)
                     with _cpu_lock:
+                        cpu_model = _get_cpu_model(model_name)
                         wav = cpu_model.tts(text, speaker_wav=speaker_wav, language=language)
                     wav = np.array(wav)
                     save_wav(wav, output_path)
@@ -210,4 +217,3 @@ if __name__ == '__main__':
     while True:
         text = input('Enter text: ')
         tts(text, f'playground/{text}.wav', speaker_wav)
-        
