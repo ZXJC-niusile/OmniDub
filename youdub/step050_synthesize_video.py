@@ -2,68 +2,73 @@
 import json
 import os
 import subprocess
-import time
 
 from loguru import logger
 
 
-def split_text(input_data,
-               punctuations=['，', '；', '：', '。', '？', '！', '\n', '”']):
-    # Chinese punctuation marks for sentence ending
-
-    # Function to check if a character is a Chinese ending punctuation
+def split_text(
+    input_data,
+    punctuations=('，', '；', '：', '。', '？', '！', '\n', '”', ',', ';', '.', '?', '!'),
+):
     def is_punctuation(char):
         return char in punctuations
 
-    # Process each item in the input data
     output_data = []
     for item in input_data:
-        start = item["start"]
-        text = item["translation"]
+        start = float(item["start"])
+        end = float(item["end"])
         speaker = item.get("speaker", "SPEAKER_00")
         original_text = (item.get("text", "") or "").strip()
+        text = (item.get("translation", "") or "").strip()
+        if not text:
+            text = original_text
+        if not text:
+            continue
+
         sentence_start = 0
         src_total_len = max(1, len(original_text))
         tgt_total_len = max(1, len(text))
+        duration_per_char = max(0.0, end - start) / tgt_total_len
 
-        # Calculate the duration for each character
-        duration_per_char = (item["end"] - item["start"]) / len(text)
         for i, char in enumerate(text):
-            # If the character is a punctuation, split the sentence
             if not is_punctuation(char) and i != len(text) - 1:
                 continue
             if i - sentence_start < 5 and i != len(text) - 1:
                 continue
-            if i < len(text) - 1 and is_punctuation(text[i+1]):
+            if i < len(text) - 1 and is_punctuation(text[i + 1]):
                 continue
-            sentence = text[sentence_start:i+1]
-            sentence_end = start + duration_per_char * len(sentence)
+            sentence = text[sentence_start : i + 1].strip()
+            if not sentence:
+                sentence_start = i + 1
+                continue
+            sentence_end = start + duration_per_char * (i + 1 - sentence_start)
             src_start = int(round((sentence_start / tgt_total_len) * src_total_len))
             src_end = int(round(((i + 1) / tgt_total_len) * src_total_len))
             src_end = min(src_total_len, max(src_start + 1, src_end))
             sentence_original = original_text[src_start:src_end].strip() or original_text
 
-            # Append the new item
             output_data.append({
                 "start": round(start, 3),
                 "end": round(sentence_end, 3),
                 "text": sentence_original,
                 "translation": sentence,
-                "speaker": speaker
+                "speaker": speaker,
             })
 
-            # Update the start for the next sentence
             start = sentence_end
             sentence_start = i + 1
 
     return output_data
-    
+
+
 def format_timestamp(seconds):
     """Converts seconds to the SRT time format."""
-    millisec = int((seconds - int(seconds)) * 1000)
-    hours, seconds = divmod(int(seconds), 3600)
-    minutes, seconds = divmod(seconds, 60)
-    return f"{hours:02}:{minutes:02}:{seconds:02},{millisec:03}"
+    seconds = max(0.0, float(seconds))
+    total_ms = int(round(seconds * 1000))
+    total_sec, millisec = divmod(total_ms, 1000)
+    hours, rem_sec = divmod(total_sec, 3600)
+    minutes, sec = divmod(rem_sec, 60)
+    return f"{hours:02}:{minutes:02}:{sec:02},{millisec:03}"
 
 
 def _escape_subtitles_path_for_filter(path: str) -> str:
@@ -75,6 +80,24 @@ def _escape_subtitles_path_for_filter(path: str) -> str:
     escaped = escaped.replace(',', r'\,').replace(';', r'\;')
     return escaped
 
+
+def _build_atempo_filter(speed_up: float) -> str:
+    """Build chained ffmpeg atempo filters supporting any positive speed factor
+    (each individual atempo stage in ffmpeg must lie in [0.5, 2.0])."""
+    speed = float(speed_up)
+    if speed <= 0:
+        raise ValueError(f'speed_up must be positive, got {speed_up}')
+    stages = []
+    while speed > 2.0:
+        stages.append('atempo=2.0')
+        speed /= 2.0
+    while speed < 0.5:
+        stages.append('atempo=0.5')
+        speed /= 0.5
+    stages.append(f'atempo={speed:.6g}')
+    return ','.join(stages)
+
+
 def wrap_text(text, max_line_char=30):
     text = ' '.join((text or '').replace('\n', ' ').split()).strip()
     if not text:
@@ -82,62 +105,83 @@ def wrap_text(text, max_line_char=30):
     lines = len(text) // (max_line_char + 1) + 1
     avg = min(round(len(text) / lines), max_line_char)
     avg = max(1, avg)
-    return '\n'.join([text[i*avg:(i+1)*avg] for i in range(lines)])
+    return '\n'.join([text[i * avg : (i + 1) * avg] for i in range(lines)])
+
 
 def generate_srt(translation, srt_path, speed_up=1, max_line_char=30):
+    speed_up = float(speed_up) if float(speed_up) > 0 else 1.0
     translation = split_text(translation)
     with open(srt_path, 'w', encoding='utf-8') as f:
         for i, item in enumerate(translation):
-            start = format_timestamp(item['start']/speed_up)
-            end = format_timestamp(item['end']/speed_up)
+            start = format_timestamp(item['start'] / speed_up)
+            end = format_timestamp(item['end'] / speed_up)
             original_text = wrap_text(item.get('text', ''), max_line_char=max_line_char + 12)
             translated_text = wrap_text(item.get('translation', ''), max_line_char=max_line_char)
-            bilingual_text = translated_text if not original_text else f'{translated_text}\n{original_text}'
-            f.write(f'{i+1}\n')
+            bilingual_text = (
+                translated_text if not original_text else f'{translated_text}\n{original_text}'
+            )
+            f.write(f'{i + 1}\n')
             f.write(f'{start} --> {end}\n')
             f.write(f'{bilingual_text}\n\n')
 
 
 def get_aspect_ratio(video_path):
-    command = ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
-               '-show_entries', 'stream=width,height', '-of', 'json', video_path]
-    result = subprocess.run(command, capture_output=True, text=True)
-    dimensions = json.loads(result.stdout)['streams'][0]
-    return dimensions['width'] / dimensions['height']
+    command = [
+        'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+        '-show_entries', 'stream=width,height', '-of', 'json', video_path,
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=True)
+    streams = json.loads(result.stdout).get('streams') or []
+    if not streams:
+        raise RuntimeError(f'No video stream found in {video_path}')
+    dimensions = streams[0]
+    height = int(dimensions['height'])
+    if height <= 0:
+        raise RuntimeError(f'Invalid video height={height} in {video_path}')
+    return int(dimensions['width']) / height
 
 
 def convert_resolution(aspect_ratio, resolution='1080p'):
+    base_px = int(str(resolution).rstrip('pP'))
     if aspect_ratio < 1:
-        width = int(resolution[:-1])
+        width = base_px
         height = int(width / aspect_ratio)
     else:
-        height = int(resolution[:-1])
+        height = base_px
         width = int(height * aspect_ratio)
-    # make sure width and height are divisibal by 2
-    width = width - width % 2
-    height = height - height % 2
-    
-    # return f'{width}x{height}'
+    # make sure width and height are divisible by 2
+    width = max(2, width - width % 2)
+    height = max(2, height - height % 2)
     return width, height
-    
+
+
 def synthesize_video(folder, subtitles=True, speed_up=1.05, fps=30, resolution='1080p'):
-    if os.path.exists(os.path.join(folder, 'video.mp4')):
+    output_video = os.path.join(folder, 'video.mp4')
+    if os.path.isfile(output_video) and os.path.getsize(output_video) > 0:
         logger.info(f'Video already synthesized in {folder}')
         return
-    
-    translation_path = os.path.join(folder, 'translation.json')
+
+    # Prefer TTS-aligned subtitle timings produced by Step 4; fall back to Step 3 translation.json.
+    aligned_translation_path = os.path.join(folder, 'translation_tts.json')
+    source_translation_path = os.path.join(folder, 'translation.json')
+    translation_path = (
+        aligned_translation_path
+        if os.path.isfile(aligned_translation_path)
+        else source_translation_path
+    )
     input_audio = os.path.join(folder, 'audio_combined.wav')
     input_video = os.path.join(folder, 'download.mp4')
-    
-    if not os.path.exists(translation_path) or not os.path.exists(input_audio):
-        return
-    
+
+    for required in (translation_path, input_audio, input_video):
+        if not os.path.isfile(required):
+            raise FileNotFoundError(f'Required input missing for video synthesis: {required}')
+
     with open(translation_path, 'r', encoding='utf-8') as f:
         translation = json.load(f)
-        
+
     srt_path = os.path.join(folder, 'subtitles.srt')
-    output_video = os.path.join(folder, 'video.mp4')
     generate_srt(translation, srt_path, speed_up)
+
     # Run ffmpeg with cwd=folder so filter args use safe local filenames.
     input_video_name = os.path.basename(input_video)
     input_audio_name = os.path.basename(input_audio)
@@ -145,36 +189,36 @@ def synthesize_video(folder, subtitles=True, speed_up=1.05, fps=30, resolution='
     srt_path_ffmpeg = _escape_subtitles_path_for_filter(os.path.basename(srt_path))
     aspect_ratio = get_aspect_ratio(input_video)
     width, height = convert_resolution(aspect_ratio, resolution)
-    resolution = f'{width}x{height}'
-    font_size = int(width/128)
-    outline = int(round(font_size/8))
+    target_res = f'{width}x{height}'
+    font_size = max(10, int(width / 128))
+    outline = max(1, int(round(font_size / 8)))
+    font_name = os.getenv('SUBTITLE_FONT_NAME', 'sans-serif')
     video_speed_filter = f"setpts=PTS/{speed_up}"
-    audio_speed_filter = f"atempo={speed_up}"
+    audio_speed_filter = _build_atempo_filter(speed_up)
     subtitle_filter = (
         f"subtitles='{srt_path_ffmpeg}':"
-        f"force_style='FontName=Arial,FontSize={font_size},"
+        f"force_style='FontName={font_name},FontSize={font_size},"
         f"PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline={outline},WrapStyle=2'"
     )
-    
-    if subtitles:
+
+    if subtitles and os.path.getsize(srt_path) > 0:
         filter_complex = f"[0:v]{video_speed_filter},{subtitle_filter}[v];[1:a]{audio_speed_filter}[a]"
     else:
         filter_complex = f"[0:v]{video_speed_filter}[v];[1:a]{audio_speed_filter}[a]"
+
     ffmpeg_command = [
         'ffmpeg',
+        '-loglevel', 'error',
         '-i', input_video_name,
         '-i', input_audio_name,
         '-filter_complex', filter_complex,
         '-map', '[v]',
         '-map', '[a]',
         '-r', str(fps),
-        '-s', resolution,
+        '-s', target_res,
         '-c:v', 'libx264',
         '-c:a', 'aac',
         output_video_name,
-        '-y'
+        '-y',
     ]
     subprocess.run(ffmpeg_command, check=True, cwd=folder)
-    time.sleep(1)
-    
-

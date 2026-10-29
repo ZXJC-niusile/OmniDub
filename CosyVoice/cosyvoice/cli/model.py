@@ -100,37 +100,41 @@ class CosyVoiceModel:
 
     def llm_job(self, text, prompt_text, llm_prompt_speech_token, llm_embedding, uuid):
         cur_silent_token_num, max_silent_token_num = 0, 5
-        with self.llm_context, torch.cuda.amp.autocast(self.fp16 is True and hasattr(self.llm, 'vllm') is False):
-            if isinstance(text, Generator):
-                assert (self.__class__.__name__ != 'CosyVoiceModel') and not hasattr(self.llm, 'vllm'), 'streaming input text is only implemented for CosyVoice2/3 and do not support vllm!'
-                token_generator = self.llm.inference_bistream(text=text,
-                                                              prompt_text=prompt_text.to(self.device),
-                                                              prompt_text_len=torch.tensor([prompt_text.shape[1]], dtype=torch.int32).to(self.device),
-                                                              prompt_speech_token=llm_prompt_speech_token.to(self.device),
-                                                              prompt_speech_token_len=torch.tensor([llm_prompt_speech_token.shape[1]], dtype=torch.int32).to(self.device),
-                                                              embedding=llm_embedding.to(self.device))
-            else:
-                token_generator = self.llm.inference(text=text.to(self.device),
-                                                     text_len=torch.tensor([text.shape[1]], dtype=torch.int32).to(self.device),
-                                                     prompt_text=prompt_text.to(self.device),
-                                                     prompt_text_len=torch.tensor([prompt_text.shape[1]], dtype=torch.int32).to(self.device),
-                                                     prompt_speech_token=llm_prompt_speech_token.to(self.device),
-                                                     prompt_speech_token_len=torch.tensor([llm_prompt_speech_token.shape[1]], dtype=torch.int32).to(self.device),
-                                                     embedding=llm_embedding.to(self.device),
-                                                     uuid=uuid)
-            for i in token_generator:
-                if i in self.silent_tokens:
-                    cur_silent_token_num += 1
-                    if cur_silent_token_num > max_silent_token_num:
-                        continue
+        try:
+            with self.llm_context, torch.cuda.amp.autocast(self.fp16 is True and hasattr(self.llm, 'vllm') is False):
+                if isinstance(text, Generator):
+                    assert (self.__class__.__name__ != 'CosyVoiceModel') and not hasattr(self.llm, 'vllm'), 'streaming input text is only implemented for CosyVoice2/3 and do not support vllm!'
+                    token_generator = self.llm.inference_bistream(text=text,
+                                                                  prompt_text=prompt_text.to(self.device),
+                                                                  prompt_text_len=torch.tensor([prompt_text.shape[1]], dtype=torch.int32).to(self.device),
+                                                                  prompt_speech_token=llm_prompt_speech_token.to(self.device),
+                                                                  prompt_speech_token_len=torch.tensor([llm_prompt_speech_token.shape[1]], dtype=torch.int32).to(self.device),
+                                                                  embedding=llm_embedding.to(self.device))
                 else:
-                    cur_silent_token_num = 0
-                self.tts_speech_token_dict[uuid].append(i)
-        self.llm_end_dict[uuid] = True
+                    token_generator = self.llm.inference(text=text.to(self.device),
+                                                         text_len=torch.tensor([text.shape[1]], dtype=torch.int32).to(self.device),
+                                                         prompt_text=prompt_text.to(self.device),
+                                                         prompt_text_len=torch.tensor([prompt_text.shape[1]], dtype=torch.int32).to(self.device),
+                                                         prompt_speech_token=llm_prompt_speech_token.to(self.device),
+                                                         prompt_speech_token_len=torch.tensor([llm_prompt_speech_token.shape[1]], dtype=torch.int32).to(self.device),
+                                                         embedding=llm_embedding.to(self.device),
+                                                         uuid=uuid)
+                for i in token_generator:
+                    if i in self.silent_tokens:
+                        cur_silent_token_num += 1
+                        if cur_silent_token_num > max_silent_token_num:
+                            continue
+                    else:
+                        cur_silent_token_num = 0
+                    self.tts_speech_token_dict[uuid].append(i)
+        finally:
+            self.llm_end_dict[uuid] = True
 
     def vc_job(self, source_speech_token, uuid):
-        self.tts_speech_token_dict[uuid] = source_speech_token.flatten().tolist()
-        self.llm_end_dict[uuid] = True
+        try:
+            self.tts_speech_token_dict[uuid] = source_speech_token.flatten().tolist()
+        finally:
+            self.llm_end_dict[uuid] = True
 
     def token2wav(self, token, prompt_token, prompt_feat, embedding, uuid, finalize=False, speed=1.0):
         with torch.cuda.amp.autocast(self.fp16):
@@ -189,57 +193,60 @@ class CosyVoiceModel:
         else:
             p = threading.Thread(target=self.vc_job, args=(source_speech_token, this_uuid))
         p.start()
-        if stream is True:
-            token_hop_len = self.token_min_hop_len
-            while True:
-                time.sleep(0.1)
-                if len(self.tts_speech_token_dict[this_uuid]) >= token_hop_len + self.token_overlap_len:
-                    this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid][:token_hop_len + self.token_overlap_len]) \
-                        .unsqueeze(dim=0)
-                    this_tts_speech = self.token2wav(token=this_tts_speech_token,
-                                                     prompt_token=flow_prompt_speech_token,
-                                                     prompt_feat=prompt_speech_feat,
-                                                     embedding=flow_embedding,
-                                                     uuid=this_uuid,
-                                                     finalize=False)
-                    yield {'tts_speech': this_tts_speech.cpu()}
-                    with self.lock:
-                        self.tts_speech_token_dict[this_uuid] = self.tts_speech_token_dict[this_uuid][token_hop_len:]
-                    # increase token_hop_len for better speech quality
-                    token_hop_len = min(self.token_max_hop_len, int(token_hop_len * self.stream_scale_factor))
-                if self.llm_end_dict[this_uuid] is True and len(self.tts_speech_token_dict[this_uuid]) < token_hop_len + self.token_overlap_len:
-                    break
+        try:
+            if stream is True:
+                token_hop_len = self.token_min_hop_len
+                while True:
+                    time.sleep(0.1)
+                    if len(self.tts_speech_token_dict[this_uuid]) >= token_hop_len + self.token_overlap_len:
+                        this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid][:token_hop_len + self.token_overlap_len]) \
+                            .unsqueeze(dim=0)
+                        this_tts_speech = self.token2wav(token=this_tts_speech_token,
+                                                         prompt_token=flow_prompt_speech_token,
+                                                         prompt_feat=prompt_speech_feat,
+                                                         embedding=flow_embedding,
+                                                         uuid=this_uuid,
+                                                         finalize=False)
+                        yield {'tts_speech': this_tts_speech.cpu()}
+                        with self.lock:
+                            self.tts_speech_token_dict[this_uuid] = self.tts_speech_token_dict[this_uuid][token_hop_len:]
+                        # increase token_hop_len for better speech quality
+                        token_hop_len = min(self.token_max_hop_len, int(token_hop_len * self.stream_scale_factor))
+                    if self.llm_end_dict[this_uuid] is True and len(self.tts_speech_token_dict[this_uuid]) < token_hop_len + self.token_overlap_len:
+                        break
+                p.join()
+                # deal with remain tokens, make sure inference remain token len equals token_hop_len when cache_speech is not None
+                this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
+                this_tts_speech = self.token2wav(token=this_tts_speech_token,
+                                                 prompt_token=flow_prompt_speech_token,
+                                                 prompt_feat=prompt_speech_feat,
+                                                 embedding=flow_embedding,
+                                                 uuid=this_uuid,
+                                                 finalize=True)
+                yield {'tts_speech': this_tts_speech.cpu()}
+            else:
+                # deal with all tokens
+                p.join()
+                this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
+                this_tts_speech = self.token2wav(token=this_tts_speech_token,
+                                                 prompt_token=flow_prompt_speech_token,
+                                                 prompt_feat=prompt_speech_feat,
+                                                 embedding=flow_embedding,
+                                                 uuid=this_uuid,
+                                                 finalize=True,
+                                                 speed=speed)
+                yield {'tts_speech': this_tts_speech.cpu()}
+        finally:
             p.join()
-            # deal with remain tokens, make sure inference remain token len equals token_hop_len when cache_speech is not None
-            this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
-            this_tts_speech = self.token2wav(token=this_tts_speech_token,
-                                             prompt_token=flow_prompt_speech_token,
-                                             prompt_feat=prompt_speech_feat,
-                                             embedding=flow_embedding,
-                                             uuid=this_uuid,
-                                             finalize=True)
-            yield {'tts_speech': this_tts_speech.cpu()}
-        else:
-            # deal with all tokens
-            p.join()
-            this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
-            this_tts_speech = self.token2wav(token=this_tts_speech_token,
-                                             prompt_token=flow_prompt_speech_token,
-                                             prompt_feat=prompt_speech_feat,
-                                             embedding=flow_embedding,
-                                             uuid=this_uuid,
-                                             finalize=True,
-                                             speed=speed)
-            yield {'tts_speech': this_tts_speech.cpu()}
-        with self.lock:
-            self.tts_speech_token_dict.pop(this_uuid)
-            self.llm_end_dict.pop(this_uuid)
-            self.mel_overlap_dict.pop(this_uuid)
-            self.hift_cache_dict.pop(this_uuid)
-            self.flow_cache_dict.pop(this_uuid)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.current_stream().synchronize()
+            with self.lock:
+                self.tts_speech_token_dict.pop(this_uuid, None)
+                self.llm_end_dict.pop(this_uuid, None)
+                self.mel_overlap_dict.pop(this_uuid, None)
+                self.hift_cache_dict.pop(this_uuid, None)
+                self.flow_cache_dict.pop(this_uuid, None)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.current_stream().synchronize()
 
 
 class CosyVoice2Model(CosyVoiceModel):
@@ -340,58 +347,62 @@ class CosyVoice2Model(CosyVoiceModel):
         else:
             p = threading.Thread(target=self.vc_job, args=(source_speech_token, this_uuid))
         p.start()
-        if stream is True:
-            token_offset = 0
-            prompt_token_pad = int(np.ceil(flow_prompt_speech_token.shape[1] / self.token_hop_len) * self.token_hop_len - flow_prompt_speech_token.shape[1])
-            while True:
-                time.sleep(0.1)
-                this_token_hop_len = self.token_hop_len + prompt_token_pad if token_offset == 0 else self.token_hop_len
-                if len(self.tts_speech_token_dict[this_uuid]) - token_offset >= this_token_hop_len + self.flow.pre_lookahead_len:
-                    this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid][:token_offset + this_token_hop_len + self.flow.pre_lookahead_len]).unsqueeze(dim=0)
-                    this_tts_speech = self.token2wav(token=this_tts_speech_token,
-                                                     prompt_token=flow_prompt_speech_token,
-                                                     prompt_feat=prompt_speech_feat,
-                                                     embedding=flow_embedding,
-                                                     token_offset=token_offset,
-                                                     uuid=this_uuid,
-                                                     stream=stream,
-                                                     finalize=False)
-                    token_offset += this_token_hop_len
-                    self.token_hop_len = min(self.token_max_hop_len, self.token_hop_len * self.stream_scale_factor)
-                    yield {'tts_speech': this_tts_speech.cpu()}
-                if self.llm_end_dict[this_uuid] is True and len(self.tts_speech_token_dict[this_uuid]) - token_offset < this_token_hop_len + self.flow.pre_lookahead_len:
-                    break
+        try:
+            if stream is True:
+                token_offset = 0
+                cur_hop_len = self.token_hop_len
+                prompt_token_pad = int(np.ceil(flow_prompt_speech_token.shape[1] / cur_hop_len) * cur_hop_len - flow_prompt_speech_token.shape[1])
+                while True:
+                    time.sleep(0.1)
+                    this_token_hop_len = cur_hop_len + prompt_token_pad if token_offset == 0 else cur_hop_len
+                    if len(self.tts_speech_token_dict[this_uuid]) - token_offset >= this_token_hop_len + self.flow.pre_lookahead_len:
+                        this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid][:token_offset + this_token_hop_len + self.flow.pre_lookahead_len]).unsqueeze(dim=0)
+                        this_tts_speech = self.token2wav(token=this_tts_speech_token,
+                                                         prompt_token=flow_prompt_speech_token,
+                                                         prompt_feat=prompt_speech_feat,
+                                                         embedding=flow_embedding,
+                                                         token_offset=token_offset,
+                                                         uuid=this_uuid,
+                                                         stream=stream,
+                                                         finalize=False)
+                        token_offset += this_token_hop_len
+                        cur_hop_len = min(self.token_max_hop_len, cur_hop_len * self.stream_scale_factor)
+                        yield {'tts_speech': this_tts_speech.cpu()}
+                    if self.llm_end_dict[this_uuid] is True and len(self.tts_speech_token_dict[this_uuid]) - token_offset < this_token_hop_len + self.flow.pre_lookahead_len:
+                        break
+                p.join()
+                # deal with remain tokens, make sure inference remain token len equals token_hop_len when cache_speech is not None
+                this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
+                this_tts_speech = self.token2wav(token=this_tts_speech_token,
+                                                 prompt_token=flow_prompt_speech_token,
+                                                 prompt_feat=prompt_speech_feat,
+                                                 embedding=flow_embedding,
+                                                 token_offset=token_offset,
+                                                 uuid=this_uuid,
+                                                 finalize=True)
+                yield {'tts_speech': this_tts_speech.cpu()}
+            else:
+                # deal with all tokens
+                p.join()
+                this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
+                this_tts_speech = self.token2wav(token=this_tts_speech_token,
+                                                 prompt_token=flow_prompt_speech_token,
+                                                 prompt_feat=prompt_speech_feat,
+                                                 embedding=flow_embedding,
+                                                 token_offset=0,
+                                                 uuid=this_uuid,
+                                                 finalize=True,
+                                                 speed=speed)
+                yield {'tts_speech': this_tts_speech.cpu()}
+        finally:
             p.join()
-            # deal with remain tokens, make sure inference remain token len equals token_hop_len when cache_speech is not None
-            this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
-            this_tts_speech = self.token2wav(token=this_tts_speech_token,
-                                             prompt_token=flow_prompt_speech_token,
-                                             prompt_feat=prompt_speech_feat,
-                                             embedding=flow_embedding,
-                                             token_offset=token_offset,
-                                             uuid=this_uuid,
-                                             finalize=True)
-            yield {'tts_speech': this_tts_speech.cpu()}
-        else:
-            # deal with all tokens
-            p.join()
-            this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
-            this_tts_speech = self.token2wav(token=this_tts_speech_token,
-                                             prompt_token=flow_prompt_speech_token,
-                                             prompt_feat=prompt_speech_feat,
-                                             embedding=flow_embedding,
-                                             token_offset=0,
-                                             uuid=this_uuid,
-                                             finalize=True,
-                                             speed=speed)
-            yield {'tts_speech': this_tts_speech.cpu()}
-        with self.lock:
-            self.tts_speech_token_dict.pop(this_uuid)
-            self.llm_end_dict.pop(this_uuid)
-            self.hift_cache_dict.pop(this_uuid)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.current_stream().synchronize()
+            with self.lock:
+                self.tts_speech_token_dict.pop(this_uuid, None)
+                self.llm_end_dict.pop(this_uuid, None)
+                self.hift_cache_dict.pop(this_uuid, None)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.current_stream().synchronize()
 
 
 class CosyVoice3Model(CosyVoice2Model):
