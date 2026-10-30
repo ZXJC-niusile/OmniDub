@@ -22,6 +22,7 @@ _XTTS_LOCAL_PATH_ENV = "OMNIDUB_XTTS_LOCAL_PATH"
 _SAFE_GLOBAL_PREFIXES = ("TTS.", "omegaconf.", "collections.", "builtins.")
 _models = {}
 _tts_locks = {}
+_load_locks = {}
 _models_lock = threading.Lock()
 _torch_load_lock = threading.Lock()
 _cpu_model = None
@@ -116,18 +117,21 @@ def load_model(model_path=None, device='auto'):
         if existing is not None:
             return existing
         _tts_locks.setdefault(device, threading.Lock())
+        dev_load_lock = _load_locks.setdefault(device, threading.Lock())
 
-    logger.info(f'Loading TTS model from {model_path} on {device}')
-    t_start = time.time()
-    loaded = _instantiate_xtts(model_path, device)
-    with _models_lock:
-        existing = _models.get(device)
-        if existing is not None:
-            return existing
-        _models[device] = loaded
-    t_end = time.time()
-    logger.info(f'TTS model loaded on {device} in {t_end - t_start:.2f}s')
-    return loaded
+    with dev_load_lock:
+        with _models_lock:
+            existing = _models.get(device)
+            if existing is not None:
+                return existing
+        logger.info(f'Loading TTS model from {model_path} on {device}')
+        t_start = time.time()
+        loaded = _instantiate_xtts(model_path, device)
+        with _models_lock:
+            _models[device] = loaded
+        t_end = time.time()
+        logger.info(f'TTS model loaded on {device} in {t_end - t_start:.2f}s')
+        return loaded
 
 
 def _is_cuda_runtime_error(error: Exception) -> bool:
@@ -161,6 +165,10 @@ def tts(text, output_path, speaker_wav, model_name=None, device='auto', language
     if not overwrite and os.path.isfile(output_path) and os.path.getsize(output_path) > 44:
         logger.info(f'TTS output already exists: {output_path}')
         return
+    text_clean = (text or '').strip()
+    if not any(ch.isalnum() for ch in text_clean):
+        save_wav(np.zeros((int(0.1 * 24000),)), output_path)
+        return
     if model_name is None:
         model_name = os.getenv(_XTTS_LOCAL_PATH_ENV)
     device = str(resolve_torch_device(device))
@@ -183,29 +191,29 @@ def tts(text, output_path, speaker_wav, model_name=None, device='auto', language
         try:
             # XTTS model is shared across pipeline workers; inference must be serialized.
             with tts_lock:
-                wav = model.tts(text, speaker_wav=speaker_wav, language=language)
+                wav = model.tts(text_clean, speaker_wav=speaker_wav, language=language)
             wav = np.array(wav)
             save_wav(wav, output_path)
-            logger.info(f'TTS {text}')
+            logger.info(f'TTS {text_clean}')
             return
         except Exception as e:
             last_error = e
-            logger.warning(f'TTS failed: {text} ({e})')
+            logger.warning(f'TTS failed: {text_clean} ({e})')
             if _is_cuda_runtime_error(e):
                 logger.warning('XTTS CUDA runtime error detected, retrying on CPU fallback...')
                 try:
                     with _cpu_lock:
                         cpu_model = _get_cpu_model(model_name)
-                        wav = cpu_model.tts(text, speaker_wav=speaker_wav, language=language)
+                        wav = cpu_model.tts(text_clean, speaker_wav=speaker_wav, language=language)
                     wav = np.array(wav)
                     save_wav(wav, output_path)
-                    logger.warning(f'TTS CPU fallback succeeded: {text}')
+                    logger.warning(f'TTS CPU fallback succeeded: {text_clean}')
                     return
                 except Exception as cpu_e:
                     last_error = cpu_e
                     logger.warning(f'TTS CPU fallback failed: {cpu_e}')
 
-    raise RuntimeError(f'XTTS failed after retries, text={text}, err={last_error}')
+    raise RuntimeError(f'XTTS failed after retries, text={text_clean}, err={last_error}')
 
 
 if __name__ == '__main__':
