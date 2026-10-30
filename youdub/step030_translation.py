@@ -55,6 +55,7 @@ def ensure_transcript_length(transcript, max_length=4000):
 
 
 def _extract_json_object(text: str):
+    """Extract a JSON dict from an LLM reply without failing when multiple {...} blocks exist."""
     if not text:
         raise ValueError('Empty model response')
     cleaned = text.strip()
@@ -64,13 +65,32 @@ def _extract_json_object(text: str):
             return obj
     except Exception:
         pass
-    match = re.search(r'\{[\s\S]*\}', cleaned)
-    if not match:
+
+    decoder = json.JSONDecoder()
+    candidates = []
+    pos = 0
+    while True:
+        brace = cleaned.find('{', pos)
+        if brace == -1:
+            break
+        try:
+            obj, end_idx = decoder.raw_decode(cleaned, brace)
+            if isinstance(obj, dict):
+                candidates.append(obj)
+                pos = end_idx
+                continue
+        except json.JSONDecodeError:
+            pass
+        pos = brace + 1
+
+    if not candidates:
         raise ValueError(f'No JSON object found in response: {cleaned[:200]}')
-    obj = json.loads(match.group(0))
-    if not isinstance(obj, dict):
-        raise ValueError(f'JSON is not an object: {type(obj).__name__}')
-    return obj
+
+    # Prefer the last non-empty-value dict in case the prompt template was echoed first.
+    for cand in reversed(candidates):
+        if any(v not in ('', [], None) for v in cand.values()):
+            return cand
+    return candidates[-1]
 
 
 def _response_snapshot(response):
@@ -272,59 +292,71 @@ def translation_postprocess(result, target_language='简体中文'):
     return result.strip()
 
 
-def valid_translation(text, translation, target_language='简体中文'):
+def _strip_translation_wrappers(translation: str) -> str:
     translation = (translation or '').strip()
-    if translation.startswith('```') and translation.endswith('```'):
+    if translation.startswith('```') and translation.endswith('```') and len(translation) >= 6:
         translation = translation[3:-3].strip()
-        return bool(translation), translation_postprocess(translation, target_language)
 
-    for prefix in ('翻译：“', '翻译："', '翻译:"', 'Translation: "', 'Translation:"'):
+    for prefix in ('翻译：“', '翻译："', '翻译:"', 'Translation: "', 'Translation:"', '译文：“', '译文："'):
         if prefix in translation:
             tail = translation.split(prefix, 1)[-1]
             closing = '”' if prefix.endswith('“') else '"'
             if closing in tail:
                 extracted = tail.split(closing, 1)[0].strip()
                 if extracted:
-                    return True, translation_postprocess(extracted, target_language)
+                    return extracted
 
-    for lq, rq in (('“', '”'), ('"', '"')):
+    for lq, rq in (('“', '”'), ('"', '"'), ('‘', '’'), ("'", "'")):
         if len(translation) >= 2 and translation.startswith(lq) and translation.endswith(rq):
             inner = translation[1:-1].strip()
             if inner:
-                return True, translation_postprocess(inner, target_language)
+                return inner
+    return translation
 
-    if not translation:
+
+def valid_translation(text, translation, target_language='简体中文'):
+    cleaned = _strip_translation_wrappers(translation)
+    if not cleaned:
         return False, 'Empty translation. Output only the translated sentence.'
 
     # Language-aware length sanity check to reject verbose model chatter without
     # penalizing valid translations into longer alphabetic languages (EN/DE/FR/RU).
-    if _is_chinese_target(target_language) and not _contains_cjk_or_kana(text):
-        max_allowed = 20 if len(text) <= 10 else max(25, int(len(text) * 1.2))
-    else:
-        max_allowed = max(80, len(text) * 6)
+    if text is not None:
+        if _is_chinese_target(target_language) and not _contains_cjk_or_kana(text):
+            max_allowed = 20 if len(text) <= 10 else max(25, int(len(text) * 1.2))
+        else:
+            max_allowed = max(80, len(text) * 6)
+        if len(cleaned) > max_allowed:
+            return False, 'The translation is too long. Only translate the sentence and output nothing else.'
 
-    if len(translation) > max_allowed:
-        return False, 'The translation is too long. Only translate the sentence and output nothing else.'
-
-    if '\n' in translation:
+    if '\n' in cleaned:
         return False, 'Do not include newlines. Output only the translated sentence.'
 
     meta_markers = ['翻译：', '译文：', '这句', '简体中文', '繁体中文', 'Translation:']
     src_lower = (text or '').lower()
     for marker in meta_markers:
-        if marker in translation and marker.lower() not in src_lower:
+        if marker in cleaned and marker.lower() not in src_lower:
             return False, f"Don't include `{marker}` in the output. Output only the translation."
 
-    return True, translation_postprocess(translation, target_language)
+    return True, translation_postprocess(cleaned, target_language)
+
+
+_ALPHA_SENTENCE_SPLIT_RE = re.compile(
+    r'(?<![A-Z])(?<!\bMr)(?<!\bMs)(?<!\bDr)(?<!\bVs)(?<!\bvs)(?<!\bSt)(?<!\bNo)(?<!\bJr)(?<!\bSr)'
+    r'([.!?]["”’\']?)\s+(?=[A-ZА-ЯЁ¡¿"“‘\'\u00C0-\u017F])'
+)
 
 
 def split_text_into_sentences(para):
     if not para:
         return []
-    para = re.sub(r'([。！？\?])([^，。！？\?”’》])', r"\1\n\2", para)
+    # CJK sentence boundaries
+    para = re.sub(r'([。！？\?])([^，。！？\?”’》\s])', r"\1\n\2", para)
     para = re.sub(r'(\.{6})([^，。！？\?”’》])', r"\1\n\2", para)
     para = re.sub(r'(\…{2})([^，。！？\?”’》])', r"\1\n\2", para)
     para = re.sub(r'([。！？\?][”’])([^，。！？\?”’》])', r'\1\n\2', para)
+    # Alphabetic (EN/DE/FR/RU/ES) sentence boundaries with abbreviation guard
+    para = _ALPHA_SENTENCE_SPLIT_RE.sub(r'\1\n', para)
     para = para.rstrip()
     return [s.strip() for s in para.split("\n") if s and s.strip()]
 
@@ -335,7 +367,7 @@ def split_sentences(translation):
         start = float(item['start'])
         end = float(item['end'])
         text = item.get('text', '')
-        speaker = item.get('speaker', 'SPEAKER_00')
+        speaker = item.get('speaker') or 'SPEAKER_00'
         translation_text = (item.get('translation') or '').strip()
         if not translation_text:
             translation_text = (text or '').strip()
@@ -390,9 +422,9 @@ def _translation_system_content(info, target_language):
 _BATCH_LINE_RE = re.compile(r'^\s*[\[\(]?(\d+)[\]\)]?\s*[\.、:：\)）]\s*(.*\S)\s*$')
 
 
-def _parse_numbered_batch(reply, expected, target_language='简体中文'):
+def _parse_numbered_batch(reply, expected, target_language='简体中文', batch_texts=None):
     """Parse a numbered reply into a list of length ``expected``; each slot is
-    the translation for that 1-based index or ``None`` if missing/unparseable."""
+    the validated translation for that 1-based index or ``None`` if missing/contaminated."""
     parsed = {}
     for raw in reply.splitlines():
         m = _BATCH_LINE_RE.match(raw)
@@ -401,12 +433,10 @@ def _parse_numbered_batch(reply, expected, target_language='简体中文'):
         i = int(m.group(1))
         if 1 <= i <= expected and i not in parsed:
             val = m.group(2).strip()
-            for lq, rq in (('“', '”'), ('"', '"'), ('‘', '’'), ("'", "'")):
-                if len(val) >= 2 and val.startswith(lq) and val.endswith(rq):
-                    val = val[1:-1].strip()
-                    break
-            if val:
-                parsed[i] = translation_postprocess(val, target_language)
+            src_text = batch_texts[i - 1] if batch_texts and (i - 1) < len(batch_texts) else None
+            ok, cleaned = valid_translation(src_text, val, target_language=target_language)
+            if ok and cleaned:
+                parsed[i] = cleaned
     return [parsed.get(i + 1) for i in range(expected)]
 
 
@@ -419,7 +449,7 @@ def _translate_batch(client, system_content, context_pairs, batch_texts, target_
         refs = '\n'.join(f'- {s[:40]} => {d[:40]}' for s, d in context_pairs[-5:])
         context_block = f'Previous translations (for terminology consistency only, do NOT repeat):\n{refs}\n\n'
 
-    numbered = '\n'.join(f'{i + 1}. {t}' for i, t in enumerate(batch_texts))
+    numbered = '\n'.join(f'{i + 1}. {t.replace(chr(10), " ").strip()}' for i, t in enumerate(batch_texts))
     base_user_content = (
         f'{context_block}Translate each of the {n} numbered lines below into {target_language}, '
         f'preserving exact line order and line count. Output ONLY {n} lines formatted as `index. translation` '
@@ -444,7 +474,10 @@ def _translate_batch(client, system_content, context_pairs, batch_texts, target_
             except Exception as api_e:
                 raise RuntimeError(f'chat.completions.create failed: {_format_api_exception(api_e)}')
             got = _parse_numbered_batch(
-                _get_response_text_multiline(response), n, target_language=target_language
+                _get_response_text_multiline(response),
+                n,
+                target_language=target_language,
+                batch_texts=batch_texts,
             )
             for j in range(n):
                 if merged[j] is None and got[j]:
@@ -477,7 +510,7 @@ def _translate_single(client, system_content, context_pairs, text, target_langua
     else:
         few_shot = [
             {'role': 'user', 'content': f'Translate into {target_language}: "Knowledge is power."'},
-            {'role': 'assistant', 'content': f'Translation: "Knowledge is power."'},
+            {'role': 'assistant', 'content': 'Translation: "Knowledge is power."'},
         ]
         user_prompt = f'Translate into {target_language} (output ONLY `Translation: "..."`): "{text}"'
 
@@ -520,11 +553,7 @@ def _rescue_translate(client, text, target_language):
             timeout=240,
             extra_body=extra_body,
         )
-        out = _get_response_text(response).strip()
-        for lq, rq in (('“', '”'), ('"', '"')):
-            if len(out) >= 2 and out.startswith(lq) and out.endswith(rq):
-                out = out[1:-1].strip()
-                break
+        out = _strip_translation_wrappers(_get_response_text(response))
         return translation_postprocess(out, target_language) if out else None
     except Exception as e:
         logger.error(f'rescue translate failed: {e}')
