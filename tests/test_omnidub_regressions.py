@@ -934,6 +934,70 @@ class OmniDubRegressionTests(unittest.TestCase):
         out5 = gated_online('https://y.be/1', target_language='русский')
         self.assertIn('CosyVoice-300M does not support', out5)
 
+    def test_14_spoken_quantifiers_cardinal_priority_and_digit_codes(self):
+        from youdub.cn_tx import TextNorm
+        norm = TextNorm()
+
+        # Bug 1 verification: quantifiers like 人, 台, 把, etc. must be read as Cardinals, not digits
+        self.assertEqual(norm('10000人'), '一万人')
+        self.assertEqual(norm('5000台电脑'), '五千台电脑')
+        self.assertEqual(norm('1000把钥匙'), '一千把钥匙')
+        self.assertEqual(norm('1000'), '一千')
+        self.assertEqual(norm('超过5000'), '超过五千')
+        self.assertEqual(norm('3.14'), '三点一四')
+
+        # True codes, prefixes, and leading zero identifiers must be read as digits
+        self.assertEqual(norm('特工007'), '特工零零七')
+        self.assertEqual(norm('他是00后球员'), '他是零零后球员')
+        self.assertEqual(norm('房间号1004'), '房间号一零零四')
+        self.assertEqual(norm('编号9527'), '编号九五二七')
+
+    def test_15_bilingual_subtitle_cue_preservation_and_word_boundary_safety(self):
+        from youdub.step050_synthesize_video import generate_srt, split_text
+
+        sample_cues = [{
+            'start': 1.0,
+            'end': 6.5,
+            'text': 'Global international cooperation is vital, because climate change affects every nation.',
+            'translation': '全球国际合作至关重要，因为气候变化影响每一个国家。',
+            'speaker': 'SPEAKER_00',
+        }]
+
+        # 1. generate_srt preserves exact speech-aligned timestamps and wraps lines without mid-token word truncation
+        with tempfile.TemporaryDirectory() as tmp:
+            srt_path = os.path.join(tmp, 'subtitles.srt')
+            generate_srt(sample_cues, srt_path, speed_up=1.0)
+            with open(srt_path, 'r', encoding='utf-8') as f:
+                srt_content = f.read()
+
+            self.assertIn('00:00:01,000 --> 00:00:06,500', srt_content)
+            # Verify no partial words like "coopera" or "tion"
+            self.assertIn('cooperation', srt_content)
+            self.assertIn('international', srt_content)
+
+        # 2. split_text word-boundary snapping guarantees complete words in both parts
+        split_pieces = split_text(sample_cues)
+        self.assertEqual(len(split_pieces), 2)
+        piece1, piece2 = split_pieces[0], split_pieces[1]
+        self.assertEqual(piece1['text'], 'Global international cooperation is')
+        self.assertEqual(piece2['text'], 'vital, because climate change affects every nation.')
+
+    def test_16_spoken_dubbing_translation_prompt_and_extra_body_fallback(self):
+        from youdub import step030_translation as tr
+
+        # Upgraded dubbing prompt includes voiceover & spoken numeral requirements
+        cn_sys = tr._translation_system_content('Title: Test', '简体中文')
+        self.assertIn('配音', cn_sys)
+        self.assertIn('一万人', cn_sys)
+        self.assertIn('五千台', cn_sys)
+        self.assertIn('智能体', cn_sys)
+
+        en_sys = tr._translation_system_content('Title: Test', 'English')
+        self.assertIn('voiceover', en_sys.lower())
+
+        # extra_body is None by default for strict OpenAI / Azure API gateway compatibility
+        self.assertIsNone(tr.extra_body)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
