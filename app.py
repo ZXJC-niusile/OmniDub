@@ -1,41 +1,50 @@
 import inspect
 
 import gradio as gr
-from youdub.pipeline import process_online_video, process_local_video
+from youdub.pipeline import (
+    _COSYVOICE_UNSUPPORTED_TARGETS,
+    process_local_video,
+    process_online_video,
+)
 
 
 def _xtts_gate(process_fn):
-    """Gate calls to *process_fn* behind an XTTS/CPML acknowledgment.
+    """Gate calls to *process_fn* behind CPML acknowledgment and language compatibility checks.
 
-    The Gradio ``inputs`` list MUST place the CPML checkbox last; this wrapper
-    reads ``args[-1]`` for that boolean, locates ``tts_engine`` by inspecting
-    the wrapped function's signature (so the order of pipeline parameters is
-    irrelevant), and refuses to invoke ``process_fn`` with ``tts_engine ==
-    'xtts'`` unless the user has acknowledged CPML. The acknowledgment flag is
-    then forwarded to the pipeline for defence-in-depth.
+    Uses ``inspect.signature(process_fn).bind_partial`` + ``apply_defaults`` so positional
+    Gradio widget inputs, keyword arguments, and default parameter values are resolved
+    deterministically without fragile index slicing.
     """
     sig = inspect.signature(process_fn)
-    param_names = list(sig.parameters.keys())
-    tts_idx = param_names.index('tts_engine') if 'tts_engine' in param_names else None
 
     def wrapped(*args, **kwargs):
-        ack = kwargs.pop('xtts_cpml_ack', None)
-        if ack is None and args:
-            ack = args[-1]
-            args = args[:-1]
+        bound = sig.bind_partial(*args, **kwargs)
+        bound.apply_defaults()
 
-        tts_engine = None
-        if tts_idx is not None and tts_idx < len(args):
-            tts_engine = args[tts_idx]
+        ack = bool(bound.arguments.get('xtts_cpml_ack', False))
+        tts_engine = bound.arguments.get('tts_engine')
+        target_language = bound.arguments.get('target_language')
 
-        if tts_engine == 'xtts' and not bool(ack):
+        if tts_engine == 'xtts' and not ack:
             return (
                 "ERROR: XTTS v2 requires explicit CPML non-commercial acknowledgment.\n"
                 "Tick the acknowledgment checkbox, or switch to 'cosyvoice' (Apache 2.0).\n"
                 "See https://coqui.ai/cpml"
             )
-        kwargs['xtts_cpml_ack'] = bool(ack)
-        return process_fn(*args, **kwargs)
+
+        if (
+            tts_engine == 'cosyvoice'
+            and str(target_language or '').strip().lower() in _COSYVOICE_UNSUPPORTED_TARGETS
+        ):
+            return (
+                f"ERROR: CosyVoice-300M does not support Target Language '{target_language}'.\n"
+                "Supported by CosyVoice-300M: 简体中文, 繁体中文, English.\n"
+                "For Deutsch / Français / русский, switch TTS Engine to 'xtts' "
+                "(requires OMNIDUB_XTTS_LOCAL_PATH and CPML acknowledgment)."
+            )
+
+        bound.arguments['xtts_cpml_ack'] = ack
+        return process_fn(*bound.args, **bound.kwargs)
 
     return wrapped
 
@@ -53,7 +62,7 @@ online_tab = gr.Interface(
         gr.Dropdown(
             ['简体中文', '繁体中文', 'English', 'Deutsch', 'Français', 'русский'],
             label='Target Language', value='简体中文'),
-        gr.Dropdown(['cosyvoice', 'xtts'], label='TTS Engine', value='xtts'),
+        gr.Dropdown(['cosyvoice', 'xtts'], label='TTS Engine', value='cosyvoice'),
         gr.Checkbox(label='Burn Subtitles', value=True),
         gr.Slider(0.5, 2.0, step=0.05, label='Speed Up', value=1.05),
         gr.Slider(1, 8, step=1, label='Parallel Workers', value=1),
