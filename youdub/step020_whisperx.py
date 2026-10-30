@@ -20,6 +20,9 @@ load_dotenv()
 _whisper_models = {}
 _align_models = {}
 _diarize_models = {}
+_whisper_load_locks = {}
+_align_load_locks = {}
+_diarize_load_locks = {}
 _registry_lock = threading.RLock()
 _infer_locks = {}
 _align_locks = {}
@@ -133,25 +136,29 @@ def load_whisper_model(model_name: str = 'large-v3', download_root='models/ASR/w
         model = _whisper_models.get(key)
         if model is not None:
             return model
-    logger.info(f'Loading WhisperX model: {model_name} on {device_key}')
-    t_start = time.time()
-    load_kwargs = {'download_root': download_root, 'device': api_device}
-    if api_device == 'cuda':
-        load_kwargs['device_index'] = device_index
-    try:
-        model = whisperx.load_model(model_name, **load_kwargs)
-    except TypeError:
-        load_kwargs.pop('device_index', None)
-        model = whisperx.load_model(model_name, **load_kwargs)
-    t_end = time.time()
-    logger.info(f'Loaded WhisperX model: {model_name} on {device_key} in {t_end - t_start:.2f}s')
-    with lock:
-        existing = _whisper_models.get(key)
-        if existing is not None:
-            return existing
-        _whisper_models[key] = model
-        _infer_locks.setdefault(key, threading.Lock())
-    return model
+        key_load_lock = _whisper_load_locks.setdefault(key, threading.Lock())
+
+    with key_load_lock:
+        with lock:
+            model = _whisper_models.get(key)
+            if model is not None:
+                return model
+        logger.info(f'Loading WhisperX model: {model_name} on {device_key}')
+        t_start = time.time()
+        load_kwargs = {'download_root': download_root, 'device': api_device}
+        if api_device == 'cuda':
+            load_kwargs['device_index'] = device_index
+        try:
+            model = whisperx.load_model(model_name, **load_kwargs)
+        except TypeError:
+            load_kwargs.pop('device_index', None)
+            model = whisperx.load_model(model_name, **load_kwargs)
+        t_end = time.time()
+        logger.info(f'Loaded WhisperX model: {model_name} on {device_key} in {t_end - t_start:.2f}s')
+        with lock:
+            _whisper_models[key] = model
+            _infer_locks.setdefault(key, threading.Lock())
+        return model
 
 
 def load_align_model(language='en', device='auto'):
@@ -162,25 +169,29 @@ def load_align_model(language='en', device='auto'):
         cached = _align_models.get(key)
         if cached is not None:
             return cached
-    t_start = time.time()
-    try:
-        align_model, align_metadata = whisperx.load_align_model(
-            language_code=language, device=device_key
-        )
-    except pickle.UnpicklingError:
-        with _pyannote_torch_load_compat():
+        key_load_lock = _align_load_locks.setdefault(key, threading.Lock())
+
+    with key_load_lock:
+        with lock:
+            cached = _align_models.get(key)
+            if cached is not None:
+                return cached
+        t_start = time.time()
+        try:
             align_model, align_metadata = whisperx.load_align_model(
                 language_code=language, device=device_key
             )
-    t_end = time.time()
-    logger.info(f'Loaded alignment model: {language} on {device_key} in {t_end - t_start:.2f}s')
-    with lock:
-        existing = _align_models.get(key)
-        if existing is not None:
-            return existing
-        _align_models[key] = (align_model, align_metadata)
-        _align_locks.setdefault(key, threading.Lock())
-    return align_model, align_metadata
+        except pickle.UnpicklingError:
+            with _pyannote_torch_load_compat():
+                align_model, align_metadata = whisperx.load_align_model(
+                    language_code=language, device=device_key
+                )
+        t_end = time.time()
+        logger.info(f'Loaded alignment model: {language} on {device_key} in {t_end - t_start:.2f}s')
+        with lock:
+            _align_models[key] = (align_model, align_metadata)
+            _align_locks.setdefault(key, threading.Lock())
+        return align_model, align_metadata
 
 
 def _instantiate_diarize_pipeline(diarization_pipeline_cls, hf_token: str, init_kwargs: dict):
@@ -209,33 +220,37 @@ def load_diarize_model(device='auto'):
         existing = _diarize_models.get(key)
         if existing is not None:
             return existing
-    t_start = time.time()
-    model_name = _get_diarization_model_name()
-    init_kwargs = {'device': device_key}
-    if model_name:
-        init_kwargs['model_name'] = model_name
-    try:
+        key_load_lock = _diarize_load_locks.setdefault(key, threading.Lock())
+
+    with key_load_lock:
+        with lock:
+            existing = _diarize_models.get(key)
+            if existing is not None:
+                return existing
+        t_start = time.time()
+        model_name = _get_diarization_model_name()
+        init_kwargs = {'device': device_key}
+        if model_name:
+            init_kwargs['model_name'] = model_name
         try:
-            diarize_model = _instantiate_diarize_pipeline(diarization_pipeline_cls, hf_token, init_kwargs)
-        except pickle.UnpicklingError:
-            logger.info('Retrying pyannote diarization load with PyTorch 2.6+ compatibility mode...')
-            with _pyannote_torch_load_compat():
+            try:
                 diarize_model = _instantiate_diarize_pipeline(diarization_pipeline_cls, hf_token, init_kwargs)
-    except Exception as e:
-        logger.exception(
-            f'Failed to load diarization model: {e}. '
-            'Please verify HF token permission and accepted pyannote model terms.'
-        )
-        return None
-    t_end = time.time()
-    logger.info(f'Loaded diarization model on {device_key} in {t_end - t_start:.2f}s')
-    with lock:
-        existing = _diarize_models.get(key)
-        if existing is not None:
-            return existing
-        _diarize_models[key] = diarize_model
-        _diarize_locks.setdefault(key, threading.Lock())
-    return diarize_model
+            except pickle.UnpicklingError:
+                logger.info('Retrying pyannote diarization load with PyTorch 2.6+ compatibility mode...')
+                with _pyannote_torch_load_compat():
+                    diarize_model = _instantiate_diarize_pipeline(diarization_pipeline_cls, hf_token, init_kwargs)
+        except Exception as e:
+            logger.exception(
+                f'Failed to load diarization model: {e}. '
+                'Please verify HF token permission and accepted pyannote model terms.'
+            )
+            return None
+        t_end = time.time()
+        logger.info(f'Loaded diarization model on {device_key} in {t_end - t_start:.2f}s')
+        with lock:
+            _diarize_models[key] = diarize_model
+            _diarize_locks.setdefault(key, threading.Lock())
+        return diarize_model
 
 
 def _ends_with_terminal_punctuation(text: str) -> bool:
@@ -245,15 +260,58 @@ def _ends_with_terminal_punctuation(text: str) -> bool:
     return text[-1] in {'。', '！', '？', '.', '!', '?'}
 
 
+def _sanitize_aligned_segments(raw_segments: list[dict]) -> list[dict]:
+    """Repair or skip segments whose 'start'/'end' keys are missing or None after whisperx.align."""
+    sanitized = []
+    cursor = 0.0
+    for seg in raw_segments or []:
+        if not isinstance(seg, dict):
+            continue
+        text = (seg.get('text') or '').strip()
+        if not text:
+            continue
+        start = seg.get('start')
+        end = seg.get('end')
+        if start is None or end is None:
+            words = [w for w in (seg.get('words') or []) if isinstance(w, dict)]
+            word_starts = [float(w['start']) for w in words if w.get('start') is not None]
+            word_ends = [float(w['end']) for w in words if w.get('end') is not None]
+            if start is None and word_starts:
+                start = min(word_starts)
+            if end is None and word_ends:
+                end = max(word_ends)
+        if start is None and end is not None:
+            start = max(cursor, float(end) - 0.5)
+        elif start is not None and end is None:
+            end = float(start) + max(0.5, min(4.0, len(text) * 0.15))
+        elif start is None and end is None:
+            start = cursor
+            end = cursor + max(0.5, min(4.0, len(text) * 0.15))
+
+        start_f = max(0.0, float(start))
+        end_f = max(start_f + 0.05, float(end))
+        cursor = end_f
+        sanitized.append({
+            'start': round(start_f, 3),
+            'end': round(end_f, 3),
+            'text': text,
+            'speaker': seg.get('speaker') or 'SPEAKER_00',
+        })
+    return sanitized
+
+
 def merge_segments(transcript, max_gap=0.5):
     if not transcript:
         return []
 
-    merged_transcription = [dict(transcript[0])]
+    first = dict(transcript[0])
+    first['speaker'] = first.get('speaker') or 'SPEAKER_00'
+    merged_transcription = [first]
     for segment in transcript[1:]:
         current = merged_transcription[-1]
+        seg_speaker = segment.get('speaker') or 'SPEAKER_00'
         gap = max(0.0, float(segment['start']) - float(current['end']))
-        same_speaker = current.get('speaker') == segment.get('speaker')
+        same_speaker = current.get('speaker') == seg_speaker
         should_merge = (
             gap < max_gap
             and not _ends_with_terminal_punctuation(current.get('text', ''))
@@ -261,11 +319,23 @@ def merge_segments(transcript, max_gap=0.5):
         )
         if should_merge:
             spacer = '' if current.get('text', '').endswith(' ') else ' '
-            current['text'] = f"{current.get('text', '')}{spacer}{segment.get('text', '').strip()}".strip()
+            current['text'] = f"{current.get('text', '')}{spacer}{(segment.get('text') or '').strip()}".strip()
             current['end'] = max(float(current['end']), float(segment['end']))
         else:
-            merged_transcription.append(dict(segment))
+            entry = dict(segment)
+            entry['speaker'] = seg_speaker
+            merged_transcription.append(entry)
     return merged_transcription
+
+
+def _has_valid_speaker_wavs(folder: str) -> bool:
+    spk_dir = os.path.join(folder, 'SPEAKER')
+    if not os.path.isdir(spk_dir):
+        return False
+    return any(
+        fn.endswith('.wav') and os.path.getsize(os.path.join(spk_dir, fn)) > 44
+        for fn in os.listdir(spk_dir)
+    )
 
 
 def transcribe_audio(
@@ -280,7 +350,11 @@ def transcribe_audio(
     source_language='auto',
 ):
     transcript_path = os.path.join(folder, 'transcript.json')
-    if os.path.isfile(transcript_path) and os.path.getsize(transcript_path) > 0:
+    if (
+        os.path.isfile(transcript_path)
+        and os.path.getsize(transcript_path) > 2
+        and _has_valid_speaker_wavs(folder)
+    ):
         logger.info(f'Transcript already exists in {folder}')
         return True
 
@@ -331,6 +405,9 @@ def transcribe_audio(
     if rec_result.get('language') == 'nn':
         raise RuntimeError(f'No recognizable spoken language detected in {wav_path}')
 
+    if not rec_result.get('segments'):
+        raise RuntimeError(f'No speech segments detected in {wav_path}')
+
     detected_language = str(rec_result.get('language', '')).strip().lower()
     align_language = forced_language or detected_language
     try:
@@ -370,17 +447,14 @@ def transcribe_audio(
         else:
             logger.warning('Diarization requested but unavailable, continue without speaker diarization.')
 
-    transcript = [
-        {
-            'start': segment['start'],
-            'end': segment['end'],
-            'text': segment['text'].strip(),
-            'speaker': segment.get('speaker', 'SPEAKER_00'),
-        }
-        for segment in rec_result['segments']
-        if segment.get('text', '').strip()
-    ]
+    transcript = _sanitize_aligned_segments(rec_result.get('segments') or [])
     transcript = merge_segments(transcript)
+    if not transcript:
+        raise RuntimeError(
+            f'Transcription produced no non-empty speech segments for {wav_path}. '
+            'The audio may contain only music, noise, or silence.'
+        )
+
     with open(transcript_path, 'w', encoding='utf-8') as f:
         json.dump(transcript, f, indent=4, ensure_ascii=False)
     logger.info(f'Transcribed {wav_path} successfully, and saved to {transcript_path}')
@@ -398,15 +472,15 @@ def generate_speaker_audio(folder, transcript):
     delay = 0.05
 
     for segment in transcript:
-        speaker = segment['speaker']
-        start = max(0, int((segment['start'] - delay) * samplerate))
-        end = min(int((segment['end'] + delay) * samplerate), length)
-        speaker_segment_audio = audio_data[start:end]
+        speaker = segment.get('speaker') or 'SPEAKER_00'
+        start = max(0, int((float(segment['start']) - delay) * samplerate))
+        end = min(int((float(segment['end']) + delay) * samplerate), length)
+        speaker_segment_audio = audio_data[start:end] if end > start else np.zeros((0,))
         prev_audio = speaker_dict.get(speaker, np.zeros((0,)))
 
         # Record verbatim transcript matching the <=29s reference prefix of SPEAKER/{speaker}.wav
         # so same-language zero-shot TTS has an exact audio-text pair.
-        if len(prev_audio) + len(speaker_segment_audio) <= max_prompt_samples:
+        if len(speaker_segment_audio) > 0 and len(prev_audio) + len(speaker_segment_audio) <= max_prompt_samples:
             seg_text = (segment.get('text') or '').strip()
             if seg_text:
                 speaker_prompts.setdefault(speaker, []).append(seg_text)
@@ -416,7 +490,15 @@ def generate_speaker_audio(folder, transcript):
     speaker_folder = os.path.join(folder, 'SPEAKER')
     os.makedirs(speaker_folder, exist_ok=True)
 
+    fallback_clip = (
+        audio_data[: min(length, int(10.0 * samplerate))]
+        if length > 0
+        else np.zeros((int(0.5 * samplerate),))
+    )
+
     for speaker, audio in speaker_dict.items():
+        if len(audio) == 0:
+            audio = fallback_clip
         speaker_file_path = os.path.join(speaker_folder, f'{speaker}.wav')
         save_wav(audio, speaker_file_path)
         prompt_lines = speaker_prompts.get(speaker)

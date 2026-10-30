@@ -11,6 +11,7 @@ from .utils import resolve_torch_device, save_wav
 
 _separators = {}
 _separator_locks = {}
+_separator_load_locks = {}
 _separator_registry_lock = threading.Lock()
 
 
@@ -36,18 +37,21 @@ def load_model(
             logger.info(f'Demucs model already loaded on {resolved_device}')
             return existing
         _separator_locks.setdefault(resolved_device, threading.Lock())
+        key_load_lock = _separator_load_locks.setdefault(cache_key, threading.Lock())
 
-    logger.info(f'Loading Demucs model: {model_name} on {resolved_device}')
-    t_start = time.time()
-    separator = Separator(model_name, device=resolved_device, progress=progress, shifts=shifts)
-    t_end = time.time()
-    logger.info(f'Demucs model loaded on {resolved_device} in {t_end - t_start:.2f} seconds')
-    with _separator_registry_lock:
-        existing = _separators.get(cache_key)
-        if existing is not None:
-            return existing
-        _separators[cache_key] = separator
-    return separator
+    with key_load_lock:
+        with _separator_registry_lock:
+            existing = _separators.get(cache_key)
+            if existing is not None:
+                return existing
+        logger.info(f'Loading Demucs model: {model_name} on {resolved_device}')
+        t_start = time.time()
+        separator = Separator(model_name, device=resolved_device, progress=progress, shifts=shifts)
+        t_end = time.time()
+        logger.info(f'Demucs model loaded on {resolved_device} in {t_end - t_start:.2f} seconds')
+        with _separator_registry_lock:
+            _separators[cache_key] = separator
+        return separator
 
 
 def separate_audio(
