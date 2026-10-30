@@ -17,7 +17,7 @@ def split_text(
     for item in input_data:
         start = float(item["start"])
         end = float(item["end"])
-        speaker = item.get("speaker", "SPEAKER_00")
+        speaker = item.get("speaker") or "SPEAKER_00"
         original_text = (item.get("text", "") or "").strip()
         text = (item.get("translation", "") or "").strip()
         if not text:
@@ -99,23 +99,60 @@ def _build_atempo_filter(speed_up: float) -> str:
 
 
 def wrap_text(text, max_line_char=30):
+    """Wrap subtitle text cleanly without dropping trailing characters or slicing words mid-token."""
     text = ' '.join((text or '').replace('\n', ' ').split()).strip()
     if not text:
         return ''
-    lines = len(text) // (max_line_char + 1) + 1
-    avg = min(round(len(text) / lines), max_line_char)
-    avg = max(1, avg)
-    return '\n'.join([text[i * avg : (i + 1) * avg] for i in range(lines)])
+    max_line_char = max(4, int(max_line_char))
+    if len(text) <= max_line_char:
+        return text
+
+    num_lines = (len(text) + max_line_char - 1) // max_line_char
+    target_width = min(max_line_char, (len(text) + num_lines - 1) // num_lines)
+
+    # Space-delimited languages (EN/DE/FR/RU/ES): wrap on word boundaries.
+    if ' ' in text:
+        words = text.split(' ')
+        lines = []
+        current = ''
+        for word in words:
+            while len(word) > max_line_char:
+                if current:
+                    lines.append(current)
+                    current = ''
+                lines.append(word[:max_line_char])
+                word = word[max_line_char:]
+            if not word:
+                continue
+            if not current:
+                current = word
+            else:
+                candidate = f'{current} {word}'
+                if len(candidate) <= target_width or (
+                    len(candidate) <= max_line_char and len(lines) >= num_lines - 1
+                ):
+                    current = candidate
+                else:
+                    lines.append(current)
+                    current = word
+        if current:
+            lines.append(current)
+        return '\n'.join(lines)
+
+    # CJK / non-space-delimited text: slice completely using ceiling step so 0 chars are ever lost.
+    return '\n'.join(text[k : k + target_width] for k in range(0, len(text), target_width))
 
 
-def generate_srt(translation, srt_path, speed_up=1, max_line_char=30):
+def generate_srt(translation, srt_path, speed_up=1, max_line_char=30, orig_max_line_char=None):
     speed_up = float(speed_up) if float(speed_up) > 0 else 1.0
+    if orig_max_line_char is None:
+        orig_max_line_char = max(max_line_char + 4, int(round(max_line_char * 1.4)))
     translation = split_text(translation)
     with open(srt_path, 'w', encoding='utf-8') as f:
         for i, item in enumerate(translation):
             start = format_timestamp(item['start'] / speed_up)
             end = format_timestamp(item['end'] / speed_up)
-            original_text = wrap_text(item.get('text', ''), max_line_char=max_line_char + 12)
+            original_text = wrap_text(item.get('text', ''), max_line_char=orig_max_line_char)
             translated_text = wrap_text(item.get('translation', ''), max_line_char=max_line_char)
             bilingual_text = (
                 translated_text if not original_text else f'{translated_text}\n{original_text}'
@@ -155,6 +192,17 @@ def convert_resolution(aspect_ratio, resolution='1080p'):
     return width, height
 
 
+def _subtitle_layout_for_aspect(aspect_ratio: float) -> tuple[int, int, int]:
+    """Return (max_line_char, orig_max_line_char, ass_font_size) adapted to landscape vs portrait."""
+    if aspect_ratio < 1.0:
+        # Portrait / 9:16 video (e.g. Shorts, Reels, Douyin): narrower lines + compact font
+        max_line_char = max(12, int(round(28 * aspect_ratio)))
+        orig_max_line_char = max(18, int(round(40 * aspect_ratio)))
+        font_size = max(9, min(12, int(round(11 * min(1.0, aspect_ratio / 0.5625)))))
+        return max_line_char, orig_max_line_char, font_size
+    return 30, 42, 15
+
+
 def synthesize_video(folder, subtitles=True, speed_up=1.05, fps=30, resolution='1080p'):
     output_video = os.path.join(folder, 'video.mp4')
     if os.path.isfile(output_video) and os.path.getsize(output_video) > 0:
@@ -179,32 +227,38 @@ def synthesize_video(folder, subtitles=True, speed_up=1.05, fps=30, resolution='
     with open(translation_path, 'r', encoding='utf-8') as f:
         translation = json.load(f)
 
+    aspect_ratio = get_aspect_ratio(input_video)
+    width, height = convert_resolution(aspect_ratio, resolution)
+    max_line_char, orig_max_line_char, font_size = _subtitle_layout_for_aspect(aspect_ratio)
+
     srt_path = os.path.join(folder, 'subtitles.srt')
-    generate_srt(translation, srt_path, speed_up)
+    generate_srt(
+        translation,
+        srt_path,
+        speed_up=speed_up,
+        max_line_char=max_line_char,
+        orig_max_line_char=orig_max_line_char,
+    )
 
     # Run ffmpeg with cwd=folder so filter args use safe local filenames.
     input_video_name = os.path.basename(input_video)
     input_audio_name = os.path.basename(input_audio)
     output_video_name = os.path.basename(output_video)
     srt_path_ffmpeg = _escape_subtitles_path_for_filter(os.path.basename(srt_path))
-    aspect_ratio = get_aspect_ratio(input_video)
-    width, height = convert_resolution(aspect_ratio, resolution)
-    target_res = f'{width}x{height}'
-    font_size = max(10, int(width / 128))
     outline = max(1, int(round(font_size / 8)))
     font_name = os.getenv('SUBTITLE_FONT_NAME', 'sans-serif')
-    video_speed_filter = f"setpts=PTS/{speed_up}"
+    video_speed_and_scale = f"setpts=PTS/{speed_up},scale={width}:{height}"
     audio_speed_filter = _build_atempo_filter(speed_up)
     subtitle_filter = (
         f"subtitles='{srt_path_ffmpeg}':"
         f"force_style='FontName={font_name},FontSize={font_size},"
-        f"PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline={outline},WrapStyle=2'"
+        f"PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline={outline},WrapStyle=0'"
     )
 
     if subtitles and os.path.getsize(srt_path) > 0:
-        filter_complex = f"[0:v]{video_speed_filter},{subtitle_filter}[v];[1:a]{audio_speed_filter}[a]"
+        filter_complex = f"[0:v]{video_speed_and_scale},{subtitle_filter}[v];[1:a]{audio_speed_filter}[a]"
     else:
-        filter_complex = f"[0:v]{video_speed_filter}[v];[1:a]{audio_speed_filter}[a]"
+        filter_complex = f"[0:v]{video_speed_and_scale}[v];[1:a]{audio_speed_filter}[a]"
 
     ffmpeg_command = [
         'ffmpeg',
@@ -215,8 +269,8 @@ def synthesize_video(folder, subtitles=True, speed_up=1.05, fps=30, resolution='
         '-map', '[v]',
         '-map', '[a]',
         '-r', str(fps),
-        '-s', target_res,
         '-c:v', 'libx264',
+        '-pix_fmt', 'yuv420p',
         '-c:a', 'aac',
         output_video_name,
         '-y',
