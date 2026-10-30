@@ -38,24 +38,18 @@ POINT = [u'点', u'點']
 
 FILLER_CHARS = ['呃', '啊']
 
-ER_WHITELIST = '(儿女|儿子|儿孙|女儿|儿媳|妻儿|' \
-    '胎儿|婴儿|新生儿|婴幼儿|幼儿|少儿|小儿|儿歌|儿童|儿科|托儿所|孤儿|' \
-    '儿戏|儿化|台儿庄|鹿儿岛|正儿八经|吊儿郎当|生儿育女|托儿带女|养儿防老|痴儿呆女|' \
-    '佳儿佳妇|儿怜兽扰|儿无常父|儿不嫌母丑|儿行千里母担忧|儿大不由爷|苏乞儿)'
-ER_WHITELIST_PATTERN = re.compile(ER_WHITELIST)
-
 # 中文数字系统类型
 NUMBERING_TYPES = ['low', 'mid', 'high']
 
 CURRENCY_NAMES = '(人民币|美元|日元|英镑|欧元|马克|法郎|加拿大元|澳元|港币|先令|芬兰马克|爱尔兰镑|' \
                  '里拉|荷兰盾|埃斯库多|比塞塔|印尼盾|林吉特|新西兰元|比索|卢布|新加坡元|韩元|泰铢)'
 CURRENCY_UNITS = '((亿|千万|百万|万|千|百)|(亿|千万|百万|万|千|百|)元|(亿|千万|百万|万|千|百|)块|角|毛|分)'
-COM_QUANTIFIERS = '(匹|张|座|回|场|尾|条|个|首|阙|阵|网|炮|顶|丘|棵|只|支|袭|辆|挑|担|颗|壳|窠|曲|墙|群|腔|' \
-                  '砣|座|客|贯|扎|捆|刀|令|打|手|罗|坡|山|岭|江|溪|钟|队|单|双|对|出|口|头|脚|板|跳|枝|件|贴|' \
-                  '针|线|管|名|位|身|堂|课|本|页|家|户|层|丝|毫|厘|分|钱|两|斤|担|铢|石|钧|锱|忽|(千|毫|微)克|' \
-                  '毫|厘|分|寸|尺|丈|里|寻|常|铺|程|(千|分|厘|毫|微)米|撮|勺|合|升|斗|石|盘|碗|碟|叠|桶|笼|盆|' \
-                  '盒|杯|钟|斛|锅|簋|篮|盘|桶|罐|瓶|壶|卮|盏|箩|箱|煲|啖|袋|钵|年|月|日|季|刻|时|周|天|秒|分|旬|' \
-                  '纪|岁|世|更|夜|春|夏|秋|冬|代|伏|辈|丸|泡|粒|颗|幢|堆|条|根|支|道|面|片|张|颗|块)'
+COM_QUANTIFIERS = (
+    r'(?:人|名|位|个|台|套|把|架|艘|部|届|所|栋|份|例|款|项|种|门|起|通|句|幅|篇|枚|度|点|倍|次|趟|番|组|批|尊|轮|局|'
+    r'场|册|家|户|双|对|只|支|本|页|张|条|件|棵|颗|头|尾|粒|块|间|幅|辆|首|层|盘|盒|瓶|罐|箱|袋|碗|碟|'
+    r'杯|锅|年|月|日|天|周|季|岁|刻|点|分|秒|毫|厘|寸|尺|丈|里|米|(?:千|分|厘|毫|微)米|千米|公里|'
+    r'克|(?:千|毫|微)克|千克|公斤|斤|两|钱|吨|升|(?:毫|微)升|元|块|角|毛|寻|排|串|封|根|段|面|群|队|阵|行|列|节|道)'
+)
 
 
 # Punctuation information are based on Zhon project (https://github.com/tsroten/zhon.git)
@@ -954,7 +948,7 @@ def normalize_nsw(raw_text):
             text = text.replace(matcher[0], Percentage(
                 percentage=matcher[0]).percentage2chntext(), 1)
 
-    # 规范化纯数+量词
+    # 规范化纯数+量词 (优先匹配有量词的数值，如 10000人, 5000台, 1000把)
     pattern = re.compile(r"(\d+(\.\d+)?)[多余几]?" + COM_QUANTIFIERS)
     matchers = pattern.findall(text)
     if matchers:
@@ -963,16 +957,22 @@ def normalize_nsw(raw_text):
             text = text.replace(matcher[0], Cardinal(
                 cardinal=matcher[0]).cardinal2chntext(), 1)
 
-    # 规范化数字编号
-    pattern = re.compile(r"(\d{4,32})")
+    # 规范化前导0的编号代码 (如 007, 010, 00后；必须以非数字为前缀避免切断大数)
+    pattern = re.compile(r"(?<!\d)(0\d+)")
     matchers = pattern.findall(text)
     if matchers:
-        # print('digit')
         for matcher in matchers:
             text = text.replace(matcher, Digit(
                 digit=matcher).digit2chntext(), 1)
 
-    # 规范化纯数
+    # 规范化显式编号/代码 (如 编号1234, ID5678, 代码002)
+    pattern = re.compile(r"((?:编号|号码|代码|工号|学号|房间号|门牌号|邮编|证件号|卡号|ID|No\.?|#)\s*)(\d+)", re.IGNORECASE)
+    matchers = pattern.findall(text)
+    if matchers:
+        for prefix, num in matchers:
+            text = text.replace(f"{prefix}{num}", f"{prefix}{Digit(digit=num).digit2chntext()}", 1)
+
+    # 规范化纯数 (如 1000, 5000, 10000, 3.14)
     pattern = re.compile(r"(\d+(\.\d+)?)")
     matchers = pattern.findall(text)
     if matchers:
@@ -980,6 +980,14 @@ def normalize_nsw(raw_text):
         for matcher in matchers:
             text = text.replace(matcher[0], Cardinal(
                 cardinal=matcher[0]).cardinal2chntext(), 1)
+
+    # 规范化剩余超长无量词连续编号串 (>= 7位，如无空格的序列号)
+    pattern = re.compile(r"(?<!\d)(\d{7,32})(?!\d)")
+    matchers = pattern.findall(text)
+    if matchers:
+        for matcher in matchers:
+            text = text.replace(matcher, Digit(
+                digit=matcher).digit2chntext(), 1)
 
     # restore P2P, O2O, B2C, B2B etc
     pattern = re.compile(r"(([a-zA-Z]+)二([a-zA-Z]+))")
@@ -992,69 +1000,29 @@ def normalize_nsw(raw_text):
     return text.lstrip('^').rstrip('$')
 
 
-def remove_erhua(text):
-    """
-    去除儿化音词中的儿:
-    他女儿在那边儿 -> 他女儿在那边
-    """
-
-    new_str = ''
-    while re.search('儿', text):
-        a = re.search('儿', text).span()
-        remove_er_flag = 0
-
-        if ER_WHITELIST_PATTERN.search(text):
-            b = ER_WHITELIST_PATTERN.search(text).span()
-            if b[0] <= a[0]:
-                remove_er_flag = 1
-
-        if remove_er_flag == 0:
-            new_str = new_str + text[0:a[0]]
-            text = text[a[1]:]
-        else:
-            new_str = new_str + text[0:b[1]]
-            text = text[b[1]:]
-
-    text = new_str + text
-    return text
-
-
-def remove_space(text):
-    tokens = text.split()
-    new = []
-    for k, t in enumerate(tokens):
-        if k != 0:
-            if IN_EN_CHARS.get(tokens[k-1][-1]) and IN_EN_CHARS.get(t[0]):
-                new.append(' ')
-        new.append(t)
-    return ''.join(new)
-
-
 class TextNorm:
-    def __init__(self,
-                 to_banjiao: bool = False,
-                 to_upper: bool = False,
-                 to_lower: bool = False,
-                 remove_fillers: bool = False,
-                 remove_erhua: bool = False,
-                 check_chars: bool = False,
-                 remove_space: bool = False,
-                 cc_mode: str = '',
-                 ):
+    def __init__(
+        self,
+        to_banjiao: bool = False,
+        to_upper: bool = False,
+        to_lower: bool = False,
+        remove_fillers: bool = False,
+        cc_mode: str = '',
+    ):
         self.to_banjiao = to_banjiao
         self.to_upper = to_upper
         self.to_lower = to_lower
         self.remove_fillers = remove_fillers
-        self.remove_erhua = remove_erhua
-        self.check_chars = check_chars
-        self.remove_space = remove_space
 
         self.cc = None
         if cc_mode:
             from opencc import OpenCC  # Open Chinese Convert: pip install opencc
             self.cc = OpenCC(cc_mode)
 
-    def __call__(self, text):
+    def __call__(self, text: str) -> str:
+        if not text:
+            return ''
+
         if self.cc:
             text = self.cc.convert(text)
 
@@ -1071,116 +1039,5 @@ class TextNorm:
             for c in FILLER_CHARS:
                 text = text.replace(c, '')
 
-        if self.remove_erhua:
-            text = remove_erhua(text)
-
         text = normalize_nsw(text)
-
-        # text = text.translate(PUNCS_TRANSFORM)
-
-        if self.check_chars:
-            for c in text:
-                if not IN_VALID_CHARS.get(c):
-                    print(
-                        f'WARNING: illegal char {c} in: {text}', file=sys.stderr)
-                    return ''
-
-        if self.remove_space:
-            text = remove_space(text)
-
         return text
-
-
-if __name__ == '__main__':
-    p = argparse.ArgumentParser()
-
-    # normalizer options
-    p.add_argument('--to_banjiao', action='store_true',
-                   help='convert quanjiao chars to banjiao')
-    p.add_argument('--to_upper', action='store_true',
-                   help='convert to upper case')
-    p.add_argument('--to_lower', action='store_true',
-                   help='convert to lower case')
-    p.add_argument('--remove_fillers', action='store_true',
-                   help='remove filler chars such as "呃, 啊"')
-    p.add_argument('--remove_erhua', action='store_true',
-                   help='remove erhua chars such as "他女儿在那边儿 -> 他女儿在那边"')
-    p.add_argument('--check_chars', action='store_true',
-                   help='skip sentences containing illegal chars')
-    p.add_argument('--remove_space', action='store_true',
-                   help='remove whitespace')
-    p.add_argument('--cc_mode', choices=['', 't2s', 's2t'],
-                   default='', help='convert between traditional to simplified')
-
-    # I/O options
-    p.add_argument('--log_interval', type=int, default=10000,
-                   help='log interval in number of processed lines')
-    p.add_argument('--has_key', action='store_true',
-                   help="will be deprecated, set --format ark instead")
-    p.add_argument('--format', type=str,
-                   choices=['txt', 'ark', 'tsv'], default='txt', help='input format')
-    p.add_argument('ifile', help='input filename, assume utf-8 encoding')
-    p.add_argument('ofile', help='output filename')
-
-    args = p.parse_args()
-
-    if args.has_key:
-        args.format = 'ark'
-
-    normalizer = TextNorm(
-        to_banjiao=args.to_banjiao,
-        to_upper=args.to_upper,
-        to_lower=args.to_lower,
-        remove_fillers=args.remove_fillers,
-        remove_erhua=args.remove_erhua,
-        check_chars=args.check_chars,
-        remove_space=args.remove_space,
-        cc_mode=args.cc_mode,
-    )
-
-    ndone = 0
-    with open(args.ifile, 'r', encoding='utf8') as istream, open(args.ofile, 'w+', encoding='utf8') as ostream:
-        if args.format == 'tsv':
-            reader = csv.DictReader(istream, delimiter='\t')
-            assert ('TEXT' in reader.fieldnames)
-            print('\t'.join(reader.fieldnames), file=ostream)
-
-            for item in reader:
-                text = item['TEXT']
-
-                if text:
-                    text = normalizer(text)
-
-                if text:
-                    item['TEXT'] = text
-                    print('\t'.join([item[f]
-                          for f in reader.fieldnames]), file=ostream)
-
-                ndone += 1
-                if ndone % args.log_interval == 0:
-                    print(f'text norm: {ndone} lines done.',
-                          file=sys.stderr, flush=True)
-        else:
-            for l in istream:
-                key, text = '', ''
-                if args.format == 'ark':  # KALDI archive, line format: "key text"
-                    cols = l.strip().split(maxsplit=1)
-                    key, text = cols[0], cols[1] if len(cols) == 2 else ''
-                else:
-                    text = l.strip()
-
-                if text:
-                    text = normalizer(text)
-
-                if text:
-                    if args.format == 'ark':
-                        print(key + '\t' + text, file=ostream)
-                    else:
-                        print(text, file=ostream)
-
-                ndone += 1
-                if ndone % args.log_interval == 0:
-                    print(f'text norm: {ndone} lines done.',
-                          file=sys.stderr, flush=True)
-    print(f'text norm: {ndone} lines done in total.',
-          file=sys.stderr, flush=True)
