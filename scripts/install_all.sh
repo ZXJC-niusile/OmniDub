@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
 ENV_NAME="${ENV_NAME:-omnidub}"
 PY_VER="${PY_VER:-3.10}"
 CUDA_INDEX_URL="${CUDA_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
+INSTALL_XTTS="${INSTALL_XTTS:-0}"
 
-echo "[precheck] verify required system binaries"
+echo "[precheck] verify required system binaries (repo: ${REPO_ROOT})"
 command -v conda >/dev/null 2>&1 || { echo "ERROR: conda not found in PATH"; exit 1; }
 command -v ffmpeg >/dev/null 2>&1 || {
   echo "ERROR: ffmpeg not found. Please install ffmpeg first.";
@@ -24,20 +29,24 @@ echo "[2/8] Install CUDA PyTorch stack"
 conda run -n "${ENV_NAME}" pip install --upgrade pip setuptools wheel
 conda run -n "${ENV_NAME}" pip install --index-url "${CUDA_INDEX_URL}" torch torchvision torchaudio
 
-echo "[3/8] Install OmniDub base dependencies"
-conda run -n "${ENV_NAME}" pip install -r requirements.txt
+echo "[3/8] Install Optional Coqui TTS first (only when INSTALL_XTTS=1) to prevent downgrading modern deps"
+if [[ "${INSTALL_XTTS}" == "1" ]]; then
+  conda run -n "${ENV_NAME}" pip install TTS
+else
+  echo "Skipping optional Coqui TTS (set INSTALL_XTTS=1 to install XTTS v2 runtime)."
+fi
 
-echo "[4/8] Install demucs (vocal separation)"
+echo "[4/8] Install OmniDub base dependencies"
+conda run -n "${ENV_NAME}" pip install -r "${REPO_ROOT}/requirements.txt"
+
+echo "[5/8] Install demucs (vocal separation)"
 conda run -n "${ENV_NAME}" pip install demucs
 
-echo "[5/8] Install WhisperX (speech recognition)"
+echo "[6/8] Install WhisperX (speech recognition)"
 conda run -n "${ENV_NAME}" pip install git+https://github.com/m-bain/whisperx.git
 
-echo "[6/8] Install Coqui TTS (XTTS v2 engine)"
-conda run -n "${ENV_NAME}" pip install TTS
-
 echo "[7/8] Install CosyVoice runtime dependencies"
-conda run -n "${ENV_NAME}" pip install -r CosyVoice/requirements.txt
+conda run -n "${ENV_NAME}" pip install -r "${REPO_ROOT}/CosyVoice/requirements.txt"
 conda run -n "${ENV_NAME}" pip install matcha-tts || {
   echo "WARNING: pip install matcha-tts failed.";
   echo "  CosyVoice requires the Matcha-TTS package for flow matching modules.";
@@ -46,12 +55,16 @@ conda run -n "${ENV_NAME}" pip install matcha-tts || {
 }
 
 echo "[8/8] Sanity check runtime imports"
-conda run -n "${ENV_NAME}" python - <<'PY'
+INSTALL_XTTS="${INSTALL_XTTS}" conda run -n "${ENV_NAME}" python - <<'PY'
 import importlib
+import os
+
 mods = [
     "gradio", "loguru", "yt_dlp", "librosa", "dotenv", "openai", "audiostretchy",
-    "PIL", "demucs", "whisperx", "TTS",
+    "PIL", "demucs", "whisperx",
 ]
+if os.getenv("INSTALL_XTTS") == "1":
+    mods.append("TTS")
 for m in mods:
     importlib.import_module(m)
 print("Import check passed.")
