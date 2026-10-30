@@ -681,8 +681,12 @@ def num2chn(number_string, numbering_type=NUMBERING_TYPES[1], big=False,
         raise ValueError(
             "invalid input num string with more than one dot: {}".format(number_string))
 
-    if use_units and len(int_string) > 1:
+    if not int_string:
+        result_symbols = [system.digits[0]]
+    elif use_units and len(int_string) > 1:
         result_symbols = get_value(int_string)
+        if not result_symbols:
+            result_symbols = [system.digits[0]] if dec_string else [system.digits[0]] * len(int_string)
     else:
         result_symbols = [system.digits[int(c)] for c in int_string]
     dec_symbols = [system.digits[int(c)] for c in dec_string]

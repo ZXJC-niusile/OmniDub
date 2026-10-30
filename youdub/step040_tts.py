@@ -44,6 +44,22 @@ _TARGET_TO_XTTS_LANG = {
     'ko': 'ko',
 }
 
+_STAGE_BRACKETS_RE = re.compile(r'[\(\（\[\【][^)\）\]\】]*[\)\）\]\】]')
+_SCORE_CONTEXT_BEFORE_RE = re.compile(r'(?:比分|战成|踢成|打成|领先|落后|以)\s*$')
+_SCORE_CONTEXT_AFTER_RE = re.compile(r'^\s*(?:获胜|取胜|胜|负|平|战平|领先|落后|击败|小胜|大胜|险胜|惜败)')
+_TIME_CONTEXT_BEFORE_RE = re.compile(
+    r'(?:早上|上午|中午|下午|晚上|凌晨|傍晚|午夜|今[晚夜早]|明[晚早天]|昨[晚天]|'
+    r'时间|当地|北京|伦敦|东京|纽约|于|在|从|到|至)\s*$'
+)
+_TIME_CONTEXT_AFTER_RE = re.compile(
+    r'^\s*(?:开球|开赛|开始|开场|播出|直播|举行|出发|抵达|到达|结束|截止|整|左右|前|后)'
+)
+_RANGE_UNITS_PATTERN = (
+    r'(?:分钟|秒钟?|小时|个?月|星期|周|天|日|年|岁|世纪|代|人|名|位|个|次|回|遍|倍|'
+    r'米|千米|公里|厘米|毫米|克|千克|公斤|吨|元|块|美元|欧元|英镑|日元|人民币|万|亿|'
+    r'%|％|度|摄氏度|华氏度|成|轮|场|局|集|季|章|节|页|行|条|项|种|座|辆|台|部|支|只|件)'
+)
+
 
 def _resolve_xtts_language(target_language: str) -> str:
     key = str(target_language or '简体中文').strip().lower()
@@ -56,12 +72,85 @@ def _is_chinese_text_or_target(text: str, target_language: str = '简体中文')
     return any('\u4e00' <= ch <= '\u9fff' for ch in (text or ''))
 
 
+def _has_speakable_content(text: str) -> bool:
+    """Return False for empty, punctuation-only, or bracketed stage-direction-only lines."""
+    if not text:
+        return False
+    stripped = _STAGE_BRACKETS_RE.sub('', text).strip()
+    return any(ch.isalnum() for ch in stripped)
+
+
 def normalize_name_connector_notation(text: str) -> str:
     # Keep foreign names fluent in TTS:
     # - remove Chinese middle dots used as name connectors (e.g., "马丁·厄德高")
     # - collapse latin initials/segments like "A.B" / "A. B"
     text = re.sub(r'(?<=[A-Za-z\u4e00-\u9fff])[·•・･](?=[A-Za-z\u4e00-\u9fff])', '', text)
     text = re.sub(r'(?<=[A-Za-z])\.\s*(?=[A-Za-z])', '', text)
+    return text
+
+
+def normalize_iso_date_notation(text: str) -> str:
+    """Convert YYYY-MM-DD / YYYY/MM/DD dates into Chinese YYYY年M月D日 before score/fraction rules."""
+    pattern = r'(?<!\d)((?:19|20)\d{2})\s*[-/.]\s*(0?[1-9]|1[0-2])\s*[-/.]\s*(0?[1-9]|[12]\d|3[01])(?!\d)'
+    return re.sub(
+        pattern,
+        lambda m: f"{m.group(1)}年{int(m.group(2))}月{int(m.group(3))}日",
+        text,
+    )
+
+
+def normalize_clock_time_notation(text: str) -> str:
+    """Convert HH:MM(:SS) clock expressions into Chinese 点/分/秒 so ':' is not read as score '比'."""
+    text = re.sub(
+        r'(?<!\d)([01]?\d|2[0-3]):([0-5]\d):([0-5]\d)(?!\d)',
+        lambda m: f"{int(m.group(1))}点{int(m.group(2))}分{int(m.group(3))}秒",
+        text,
+    )
+
+    pattern = r'(?<!\d)([01]?\d|2[0-3])[:：]([0-5]\d)(?!\d)'
+
+    def _replace_hhmm(match):
+        h_str, m_str = match.group(1), match.group(2)
+        before = text[max(0, match.start() - 10):match.start()]
+        after = text[match.end():match.end() + 8]
+        if _SCORE_CONTEXT_BEFORE_RE.search(before) or _SCORE_CONTEXT_AFTER_RE.search(after):
+            return match.group(0)
+        is_clock = (
+            bool(_TIME_CONTEXT_BEFORE_RE.search(before))
+            or bool(_TIME_CONTEXT_AFTER_RE.search(after))
+            or (len(h_str) == 2 and h_str.startswith('0'))
+            or m_str in {'00', '15', '30', '45'}
+        )
+        if not is_clock:
+            return match.group(0)
+        h_val = int(h_str)
+        m_val = int(m_str)
+        if m_val == 0:
+            return f"{h_val}点整"
+        if m_val < 10:
+            return f"{h_val}点零{m_val}分"
+        return f"{h_val}点{m_val}分"
+
+    return re.sub(pattern, _replace_hhmm, text)
+
+
+def normalize_range_notation(text: str) -> str:
+    """Convert numeric ranges (e.g. '3-5分钟', '18-25岁', '第10-15分钟', '5~10') into '到'."""
+    text = re.sub(
+        rf'(?<!\d)(\d{{1,4}}(?:\.\d+)?)\s*[-–—－~～]\s*(\d{{1,4}}(?:\.\d+)?)(?=\s*{_RANGE_UNITS_PATTERN})',
+        r'\1到\2',
+        text,
+    )
+    text = re.sub(
+        r'((?:第|约|大约|大概|近|长达|耗时|历时|时速)\s*)(\d{1,4}(?:\.\d+)?)\s*[-–—－~～]\s*(\d{1,4}(?:\.\d+)?)(?!\s*[-–—－]\s*\d)',
+        r'\1\2到\3',
+        text,
+    )
+    text = re.sub(
+        r'(?<!\d)(\d{1,4}(?:\.\d+)?)\s*[~～]\s*(\d{1,4}(?:\.\d+)?)(?!\d)',
+        r'\1到\2',
+        text,
+    )
     return text
 
 
@@ -114,18 +203,26 @@ def normalize_formation_notation(text: str) -> str:
 
 def preprocess_text(text, target_language='简体中文'):
     text = (text or '').strip()
+    if not _has_speakable_content(text):
+        return ''
+    text = _STAGE_BRACKETS_RE.sub('', text).strip()
+    if not _has_speakable_content(text):
+        return ''
     if not _is_chinese_text_or_target(text, target_language):
         return text
 
     text = re.sub(r'(?<![A-Za-z0-9])AI(?![A-Za-z0-9])', '人工智能', text)
     text = normalize_name_connector_notation(text)
+    text = normalize_iso_date_notation(text)
     text = normalize_year_list_notation(text)
+    text = normalize_clock_time_notation(text)
     text = normalize_formation_notation(text)
+    text = normalize_range_notation(text)
     text = normalize_score_notation(text)
     text = re.sub(r'(?<!^)([A-Z])', r' \1', text)
     text = normalizer(text)
     text = re.sub(r'(?<=[a-zA-Z])(?=\d)|(?<=\d)(?=[a-zA-Z])', ' ', text)
-    return text.strip()
+    return text.strip() if _has_speakable_content(text) else ''
 
 
 def adjust_audio_length(
@@ -143,10 +240,17 @@ def adjust_audio_length(
         min(desired_length / current_length, max_speed_factor), min_speed_factor
     )
     adjusted_length = current_length * speed_factor
-    target_path = wav_path.replace('.wav', '_adjusted.wav')
+    if abs(speed_factor - 1.0) <= 1e-4:
+        wav, sample_rate = librosa.load(wav_path, sr=sample_rate)
+        return wav, len(wav) / float(sample_rate), 1.0, current_length
+
+    stem, ext = os.path.splitext(wav_path)
+    target_path = f"{stem}_adjusted{ext or '.wav'}"
     stretch_audio(wav_path, target_path, ratio=speed_factor, sample_rate=sample_rate)
     wav, sample_rate = librosa.load(target_path, sr=sample_rate)
-    return wav[: int(adjusted_length * sample_rate)], adjusted_length, speed_factor, current_length
+    sliced = wav[: int(adjusted_length * sample_rate)]
+    actual_len = len(sliced) / float(sample_rate) if len(sliced) > 0 else adjusted_length
+    return sliced, actual_len, speed_factor, current_length
 
 
 def _load_speaker_prompt_texts(folder: str, speakers: set[str]) -> dict[str, str]:
@@ -164,6 +268,27 @@ def _load_speaker_prompt_texts(folder: str, speakers: set[str]) -> dict[str, str
             except OSError:
                 pass
     return prompts
+
+
+def _resolve_speaker_wav(folder: str, speaker: str) -> str:
+    """Resolve a valid non-empty reference WAV for speaker, falling back gracefully."""
+    speaker_dir = os.path.join(folder, 'SPEAKER')
+    primary = os.path.join(speaker_dir, f'{speaker}.wav')
+    if os.path.isfile(primary) and os.path.getsize(primary) > 44:
+        return primary
+    if os.path.isdir(speaker_dir):
+        for fn in sorted(os.listdir(speaker_dir)):
+            if fn.endswith('.wav') and not fn.endswith('_30s.wav'):
+                cand = os.path.join(speaker_dir, fn)
+                if os.path.isfile(cand) and os.path.getsize(cand) > 44:
+                    logger.warning(f'Speaker wav missing for {speaker}, falling back to {cand}')
+                    return cand
+    for fallback_name in ('audio_vocals.wav', 'audio.wav'):
+        cand = os.path.join(folder, fallback_name)
+        if os.path.isfile(cand) and os.path.getsize(cand) > 44:
+            logger.warning(f'Speaker wav missing for {speaker}, falling back to {cand}')
+            return cand
+    return primary
 
 
 def _prepare_segment_wav_cache(output_folder: str, cache_params: dict) -> None:
@@ -247,7 +372,10 @@ def generate_wavs(folder, tts_engine=None, tts_device='auto', target_language='�
         # Work on a deep copy so Step 3's translation.json stays immutable across reruns.
         transcript = copy.deepcopy(json.load(f))
 
-    speakers = {line.get('speaker', 'SPEAKER_00') for line in transcript}
+    for line in transcript:
+        line['speaker'] = line.get('speaker') or 'SPEAKER_00'
+
+    speakers = {line['speaker'] for line in transcript}
     logger.info(f'Found {len(speakers)} speakers, tts_engine={tts_engine}')
 
     _prepare_segment_wav_cache(
@@ -257,7 +385,7 @@ def generate_wavs(folder, tts_engine=None, tts_device='auto', target_language='�
             'target_language': target_language,
             'formation_tts_style': os.getenv('FORMATION_TTS_STYLE', FORMATION_TTS_STYLE),
             'segments': [
-                (line.get('speaker', 'SPEAKER_00'), line.get('translation', ''))
+                (line['speaker'], line.get('translation', ''))
                 for line in transcript
             ],
         },
@@ -276,18 +404,20 @@ def generate_wavs(folder, tts_engine=None, tts_device='auto', target_language='�
     original_ends = [float(line['end']) for line in transcript]
 
     for i, line in enumerate(transcript):
-        speaker = line.get('speaker', 'SPEAKER_00')
+        speaker = line['speaker']
         text = preprocess_text(line.get('translation', ''), target_language=target_language)
         output_path = os.path.join(output_folder, f'{str(i).zfill(4)}.wav')
         if not text:
             save_wav(np.zeros((int(0.1 * 24000),)), output_path)
             continue
-        speaker_wav = os.path.join(folder, 'SPEAKER', f'{speaker}.wav')
+        speaker_wav = _resolve_speaker_wav(folder, speaker)
         tts_func(text, output_path, speaker_wav, speaker)
         if not os.path.isfile(output_path):
             raise RuntimeError(f'TTS output missing after synthesis: {output_path}')
 
     # Pass 2: assemble full_wav with drift-recovery scheduling.
+    # Importantly, line['end'] records ONLY the end of spoken audio (not trailing silence padding),
+    # preventing subtitles from staying frozen across long instrumental/silent gaps.
     full_wav = np.zeros((0,))
     n = len(transcript)
     for i, line in enumerate(transcript):
@@ -296,17 +426,15 @@ def generate_wavs(folder, tts_engine=None, tts_device='auto', target_language='�
         original_length = max(0.05, original_end - original_start)
         next_start = original_starts[i + 1] if i < n - 1 else None
 
-        last_end = len(full_wav) / 24000
+        last_end = len(full_wav) / 24000.0
         lag = original_start - last_end
 
         if lag >= 0.0:
             if lag > 1e-3:
                 full_wav = np.concatenate((full_wav, np.zeros((int(lag * 24000),))))
-            start = len(full_wav) / 24000
+            start = len(full_wav) / 24000.0
         else:
             start = last_end
-
-        line['start'] = start
 
         desired_end = start + original_length
         if next_start is not None:
@@ -326,22 +454,21 @@ def generate_wavs(folder, tts_engine=None, tts_device='auto', target_language='�
             )
 
         full_wav = np.concatenate((full_wav, wav))
-        line_end = start + length
+        speech_end = len(full_wav) / 24000.0
+        line['start'] = round(start, 3)
+        line['end'] = round(max(start + 0.05, speech_end), 3)
 
         if next_start is not None:
-            slack_to_next = next_start - line_end
+            slack_to_next = next_start - speech_end
             if slack_to_next >= SHORT_GAP_NO_SILENCE_SEC:
                 post_pad = slack_to_next
             else:
                 post_pad = 0.0
         else:
-            post_pad = max(0.0, original_end - line_end)
+            post_pad = max(0.0, original_end - speech_end)
 
         if post_pad > 1e-3:
             full_wav = np.concatenate((full_wav, np.zeros((int(post_pad * 24000),))))
-            line_end += post_pad
-
-        line['end'] = line_end
 
     vocal_wav, _ = librosa.load(os.path.join(folder, 'audio_vocals.wav'), sr=24000)
     max_full = np.max(np.abs(full_wav)) if len(full_wav) > 0 else 0.0
