@@ -12,9 +12,15 @@ load_dotenv()
 
 model_name = os.getenv('MODEL_NAME', 'gpt-3.5-turbo')
 logger.info(f'using model {model_name}')
-extra_body = {
-    'repetition_penalty': 1.1,
-}
+
+# Repetition penalty is a vLLM/FastChat vendor parameter. If using standard OpenAI or proxies
+# that reject extra fields, leave OMNIDUB_REPETITION_PENALTY unset (or set to 0) to omit.
+_rep_penalty_env = os.getenv('OMNIDUB_REPETITION_PENALTY')
+try:
+    _rep_penalty_val = float(_rep_penalty_env) if _rep_penalty_env else None
+except ValueError:
+    _rep_penalty_val = None
+extra_body = {'repetition_penalty': _rep_penalty_val} if _rep_penalty_val and _rep_penalty_val > 1.0 else None
 # Lines translated per API call. Batching cuts request count ~10x vs the old
 # one-call-per-line loop while preserving order via index tags. Env-overridable.
 try:
@@ -403,19 +409,25 @@ def _make_client():
 def _translation_system_content(info, target_language):
     if _is_chinese_target(target_language):
         return (
-            f'You are a expert in the field of this video.\n{info}\n'
-            f'Translate into {target_language}. 请充当翻译家，把内容翻译得自然、流畅、地道，'
-            f'不要翻译腔，使用优美高雅的表达。术语要求：人工智能中的"agent"译为"智能体"；'
-            f'强化学习中是`Q-Learning`而非`Queue Learning`；深度学习语境下的"Transformer"是'
-            f'模型架构名，保持英文"Transformer"，不要译成"变压器"；专有名词、产品名、代码标识符'
-            f'保持原文。数学公式写成 plain text，不要用 latex。确保准确、简洁，注意信达雅。'
+            f'You are an expert video translator and professional voiceover dubbing specialist.\n{info}\n'
+            f'Translate into {target_language}. 请将内容翻译为地道、自然、流畅、适合语音配音（TTS）朗读的口语化表达，'
+            f'杜绝生硬直译与翻译腔。\n'
+            f'【配音与口语化规范】：\n'
+            f'1. 数字与量词口语化：将文本中的数值、数量、金额、年份、日期、时间、百分比、比分等，按中文日常口语朗读习惯'
+            f'直接转写为规范汉字（例如：10,000人译为"一万人"；5000台译为"五千台"；$50M译为"五千万美元"；2024年译为"二零二四年"；'
+            f'50%译为"百分之五十"；3-5分钟译为"三到五分钟"；比分2:1译为"二比一"）。\n'
+            f'2. 专有名词与技术标识：产品型号、硬件架构、代码符号、英文缩写保持标准原文（例如：GPT-4、iPhone 15、A100、Transformer、Q-Learning）。'
+            f'人工智能中的"agent"译为"智能体"。\n'
+            f'3. 标点与格式：数学公式写为平实易读的口语文本（避免 LaTeX）。译文表达要简洁凝练、朗朗上口，方便听众理解。'
         )
     return (
-        f'You are an expert translator in the domain of this video.\n{info}\n'
-        f'Translate accurately, naturally, and idiomatically into {target_language}. '
-        f'Keep proper nouns, product names, code identifiers, and technical acronyms '
-        f'(such as Transformer, Q-Learning) intact where appropriate. '
-        f'Write math expressions as plain text without LaTeX.'
+        f'You are an expert video translator and professional voiceover dubbing specialist.\n{info}\n'
+        f'Translate accurately, naturally, and idiomatically into {target_language} for voiceover dubbing (TTS).\n'
+        f'【Voiceover & Dubbing Guidelines】:\n'
+        f'1. Conversational Fluency: Use natural, spoken phrasing suitable for oral narration; avoid awkward literal translation.\n'
+        f'2. Numbers & Measures: Render amounts, numbers, percentages, dates, and units in the target language\'s standard oral spoken form.\n'
+        f'3. Proper Nouns & Code: Keep product models, brand names, code identifiers, and technical acronyms (such as Transformer, Q-Learning, GPT-4) intact.\n'
+        f'4. Math & Symbols: Write mathematical expressions as plain readable text without LaTeX.'
     )
 
 
