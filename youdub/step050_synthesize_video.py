@@ -6,6 +6,28 @@ import subprocess
 from loguru import logger
 
 
+def _snap_word_boundary(text: str, idx: int, total_len: int) -> int:
+    """Snap character index to nearest whitespace boundary for space-delimited text,
+    guaranteeing that words are never truncated mid-token."""
+    if idx <= 0:
+        return 0
+    if idx >= total_len:
+        return total_len
+    if ' ' not in text:
+        return idx
+    if text[idx - 1].isspace() or (idx < total_len and text[idx].isspace()):
+        return idx
+    left = text.rfind(' ', 0, idx)
+    right = text.find(' ', idx)
+    if left == -1 and right == -1:
+        return idx
+    if left == -1:
+        return right + 1
+    if right == -1:
+        return left
+    return left if (idx - left) <= (right - idx) else (right + 1)
+
+
 def split_text(
     input_data,
     punctuations=('，', '；', '：', '。', '？', '！', '\n', '”', ',', ';', '.', '?', '!'),
@@ -42,9 +64,12 @@ def split_text(
                 sentence_start = i + 1
                 continue
             sentence_end = start + duration_per_char * (i + 1 - sentence_start)
-            src_start = int(round((sentence_start / tgt_total_len) * src_total_len))
-            src_end = int(round(((i + 1) / tgt_total_len) * src_total_len))
-            src_end = min(src_total_len, max(src_start + 1, src_end))
+            src_start_raw = int(round((sentence_start / tgt_total_len) * src_total_len))
+            src_end_raw = int(round(((i + 1) / tgt_total_len) * src_total_len))
+            src_start = _snap_word_boundary(original_text, src_start_raw, src_total_len)
+            src_end = _snap_word_boundary(original_text, src_end_raw, src_total_len)
+            if src_end <= src_start:
+                src_end = min(src_total_len, max(src_start + 1, src_end_raw))
             sentence_original = original_text[src_start:src_end].strip() or original_text
 
             output_data.append({
@@ -143,11 +168,19 @@ def wrap_text(text, max_line_char=30):
     return '\n'.join(text[k : k + target_width] for k in range(0, len(text), target_width))
 
 
-def generate_srt(translation, srt_path, speed_up=1, max_line_char=30, orig_max_line_char=None):
+def generate_srt(
+    translation,
+    srt_path,
+    speed_up=1,
+    max_line_char=30,
+    orig_max_line_char=None,
+    split_subtitles: bool = False,
+):
     speed_up = float(speed_up) if float(speed_up) > 0 else 1.0
     if orig_max_line_char is None:
         orig_max_line_char = max(max_line_char + 4, int(round(max_line_char * 1.4)))
-    translation = split_text(translation)
+    if split_subtitles:
+        translation = split_text(translation)
     with open(srt_path, 'w', encoding='utf-8') as f:
         for i, item in enumerate(translation):
             start = format_timestamp(item['start'] / speed_up)
