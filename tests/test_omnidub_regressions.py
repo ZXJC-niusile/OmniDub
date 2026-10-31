@@ -397,7 +397,7 @@ class OmniDubRegressionTests(unittest.TestCase):
             # Line 0 ends at 1.0s, followed by a 10s BGM gap before Line 1 at 11.0s;
             # Line 2 is punctuation-only "...", Line 3 is stage-direction "（掌声）" with speaker=None.
             orig_data = [
-                {'start': 0.0, 'end': 1.0, 'text': 'Hello', 'translation': '你好', 'speaker': 'SPEAKER_00'},
+                {'start': 0.0, 'end': 1.0, 'text': 'Hello', 'translation': '误差0.05，GPT-4', 'speaker': 'SPEAKER_00'},
                 {'start': 11.0, 'end': 12.0, 'text': 'World', 'translation': '世界', 'speaker': 'SPEAKER_00'},
                 {'start': 12.5, 'end': 13.0, 'text': '...', 'translation': '...', 'speaker': 'SPEAKER_00'},
                 {'start': 13.2, 'end': 14.0, 'text': '(Applause)', 'translation': '（掌声）', 'speaker': None},
@@ -426,7 +426,7 @@ class OmniDubRegressionTests(unittest.TestCase):
                 st_tts.generate_wavs(tmp, tts_engine='cosyvoice', target_language='简体中文')
 
             # Only speakable lines invoke TTS; "..." and "（掌声）" become clean silence
-            self.assertEqual(synthesized_texts, [('你好', 'SPEAKER_00'), ('世界', 'SPEAKER_00')])
+            self.assertEqual(synthesized_texts, [('误差0.05，GPT-4', 'SPEAKER_00'), ('世界', 'SPEAKER_00')])
 
             # Step 3 translation.json remains untouched
             with open(tr_path, 'r', encoding='utf-8') as f:
@@ -849,7 +849,7 @@ class OmniDubRegressionTests(unittest.TestCase):
                 nonlocal cv_calls
                 cv_calls += 1
                 time.sleep(0.05)
-                self.frontend = types.SimpleNamespace(device='cuda', spk2info={})
+                self.frontend = types.SimpleNamespace(device='cuda', spk2info={}, text_frontend='wetext')
                 self.model = types.SimpleNamespace(
                     device='cuda',
                     llm=_SubMod(),
