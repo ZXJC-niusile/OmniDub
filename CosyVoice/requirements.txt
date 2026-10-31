@@ -14,3 +14,6 @@ omegaconf
 transformers
 tiktoken
 regex
+
+# Native text normalization; OmniDub rejects the simplified fallback.
+wetext==0.2.0

@@ -62,15 +62,17 @@ class CosyVoiceFrontEnd:
             self.frd.set_lang_type('pinyinvg')
             self.text_frontend = 'ttsfrd'
             logging.info('use ttsfrd frontend')
-        except:
+        except Exception as exc:
+            logging.info('ttsfrd unavailable, trying wetext: %s', exc)
             try:
                 from wetext import Normalizer as ZhNormalizer
                 from wetext import Normalizer as EnNormalizer
-                self.zh_tn_model = ZhNormalizer(remove_erhua=False)
-                self.en_tn_model = EnNormalizer()
+                self.zh_tn_model = ZhNormalizer(lang="zh", operator="tn", remove_erhua=False)
+                self.en_tn_model = EnNormalizer(lang="en", operator="tn")
                 self.text_frontend = 'wetext'
                 logging.info('use wetext frontend')
-            except:
+            except Exception as exc:
+                logging.warning('wetext frontend initialization failed: %s', exc)
                 self.text_frontend = ''
                 logging.info('no frontend is avaliable')
 

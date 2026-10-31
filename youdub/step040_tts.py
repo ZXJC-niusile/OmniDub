@@ -8,6 +8,7 @@ import librosa
 from loguru import logger
 import numpy as np
 
+from .text_frontend import normalization_identity
 from .cn_tx import TextNorm
 from .utils import compute_fingerprint, save_wav, save_wav_norm
 
@@ -201,10 +202,14 @@ def normalize_formation_notation(text: str) -> str:
     return re.sub(pattern, _replace, text)
 
 
-def preprocess_text(text, target_language='简体中文'):
+def preprocess_text(text, target_language='简体中文', tts_engine='xtts'):
     text = (text or '').strip()
     if not _has_speakable_content(text):
         return ''
+    # CosyVoice owns number reading, punctuation and sentence splitting.
+    # Only the existing empty/stage-only gate runs before its native frontend.
+    if tts_engine == 'cosyvoice':
+        return text
     text = _STAGE_BRACKETS_RE.sub('', text).strip()
     if not _has_speakable_content(text):
         return ''
@@ -382,6 +387,7 @@ def generate_wavs(folder, tts_engine=None, tts_device='auto', target_language='�
         output_folder,
         {
             'tts_engine': tts_engine,
+            'text_normalization': normalization_identity(tts_engine),
             'target_language': target_language,
             'formation_tts_style': os.getenv('FORMATION_TTS_STYLE', FORMATION_TTS_STYLE),
             'segments': [
@@ -405,7 +411,7 @@ def generate_wavs(folder, tts_engine=None, tts_device='auto', target_language='�
 
     for i, line in enumerate(transcript):
         speaker = line['speaker']
-        text = preprocess_text(line.get('translation', ''), target_language=target_language)
+        text = preprocess_text(line.get('translation', ''), target_language=target_language, tts_engine=tts_engine)
         output_path = os.path.join(output_folder, f'{str(i).zfill(4)}.wav')
         if not text:
             save_wav(np.zeros((int(0.1 * 24000),)), output_path)

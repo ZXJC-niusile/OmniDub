@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torchaudio
 
+from .text_frontend import normalization_identity, require_native_frontend
 from .utils import resolve_torch_device, save_wav
 
 # 找到 CosyVoice 的根目录
@@ -94,10 +95,13 @@ def load_cosyvoice_model(device: str = 'auto'):
                         loaded = CosyVoice(model_name)
                 else:
                     loaded = CosyVoice(model_name)
+                backend = require_native_frontend(loaded)
+                logger.info(f'CosyVoice normalization: backend={backend}, identity={normalization_identity("cosyvoice")}')
                 _bind_cosyvoice_device(loaded, device_key)
                 logger.info(f"CosyVoice model loaded from: {model_name} on {device_key}")
                 break
             except Exception as e:
+                loaded = None
                 last_error = e
                 logger.warning(f"Failed to load CosyVoice model from {model_name}: {e}")
 
@@ -187,7 +191,7 @@ def generate_cosyvoice_audio(
             with dev_ctx:
                 if use_zero_shot:
                     try:
-                        result_generator = model.inference_zero_shot(text_clean, prompt_text, prompt_path)
+                        result_generator = model.inference_zero_shot(text_clean, prompt_text, prompt_path, text_frontend=True)
                         chunks = _collect_tts_chunks(result_generator)
                         if not chunks:
                             raise RuntimeError("CosyVoice zero-shot yielded 0 chunks.")
@@ -195,10 +199,10 @@ def generate_cosyvoice_audio(
                         logger.warning(
                             f"CosyVoice zero-shot failed, fallback to cross-lingual. err={zero_shot_err}"
                         )
-                        result_generator = model.inference_cross_lingual(text_clean, prompt_path)
+                        result_generator = model.inference_cross_lingual(text_clean, prompt_path, text_frontend=True)
                         chunks = _collect_tts_chunks(result_generator)
                 else:
-                    result_generator = model.inference_cross_lingual(text_clean, prompt_path)
+                    result_generator = model.inference_cross_lingual(text_clean, prompt_path, text_frontend=True)
                     chunks = _collect_tts_chunks(result_generator)
 
         if not chunks:
